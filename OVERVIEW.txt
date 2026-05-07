@@ -1,0 +1,828 @@
+================================================================================
+  HYBRID BROWSER-AGENT / MCP SERVER FOR ONLINE TERRITORY MANAGER (OTM)
+  Complete In-Depth Overview
+================================================================================
+
+--------------------------------------------------------------------------------
+WHAT THIS PROJECT IS
+--------------------------------------------------------------------------------
+
+This project automates a website called Online Territory Manager (OTM), located
+at https://onlineterritorymanager.com. OTM is a web app used by Jehovah's
+Witness congregations to track and manage territory cards — geographic areas
+assigned to publishers (congregation members) for door-to-door ministry work.
+
+Instead of logging into OTM manually and clicking through the interface, this
+project lets you type a plain-English instruction like:
+
+  "Assign territory 42 to Jane Smith"
+
+...and an AI agent will open a real browser, log in, navigate the site, find
+the right territory, click the checkout button, fill in Jane's name, and confirm
+the assignment — all automatically.
+
+The project has two modes:
+  1. CLI Agent  — you run it from the terminal and give it a task in plain text.
+  2. MCP Server — it exposes all its OTM actions as tools that any MCP-compatible
+                  AI client (like Claude Desktop) can call directly.
+
+
+--------------------------------------------------------------------------------
+THE TECH STACK
+--------------------------------------------------------------------------------
+
+Node.js (v18+)
+  The runtime. Everything is written in JavaScript running on Node.
+
+ES Modules
+  The project uses "type": "module" in package.json, which means all files use
+  the modern "import/export" syntax instead of the older "require()" style.
+  Every import must include the .js file extension explicitly.
+
+Playwright
+  A browser automation library by Microsoft. It controls a real Chromium browser
+  programmatically — navigating pages, clicking buttons, filling forms, reading
+  page content — exactly as a human would, but from code.
+
+@anthropic-ai/sdk
+  The official Anthropic SDK for calling Claude models via the Claude API.
+
+openai
+  The official OpenAI SDK for calling GPT models (GPT-4o, GPT-4o-mini, etc.).
+
+groq-sdk
+  The Groq SDK for calling open-source models (Llama, Mixtral, etc.) hosted on
+  Groq's ultra-fast inference infrastructure. Groq's API is OpenAI-compatible,
+  meaning it uses the exact same message format as OpenAI.
+
+@modelcontextprotocol/sdk
+  The MCP (Model Context Protocol) SDK. MCP is an open standard developed by
+  Anthropic that lets AI models discover and call external "tools" in a
+  standardized way. This SDK lets us build an MCP Server that exposes OTM
+  actions as tools any MCP client can use.
+
+dotenv
+  Loads environment variables from the .env file into process.env so credentials
+  and API keys are never hardcoded in the source code.
+
+
+--------------------------------------------------------------------------------
+PROJECT FILE STRUCTURE
+--------------------------------------------------------------------------------
+
+Hybrid-Agent-MCP-OTM/
+│
+├── index.js           Entry point for the CLI agent
+├── providers.js       Unified AI provider abstraction layer
+├── mcp-server.js      OTM tool logic + standalone MCP Server
+├── browser.js         Playwright browser session manager
+│
+├── .env               Credentials and configuration (never commit this)
+├── cookies.json       Saved browser session — auto-created on first login
+├── package.json       Project metadata and dependency list
+├── .gitignore         Prevents .env and cookies.json from being committed
+│
+├── README.md          Setup and usage documentation
+├── CLAUDE.md          Context file for Claude Code (this AI assistant)
+├── OVERVIEW.txt       This file
+│
+└── .claude/
+    ├── agents/
+    │   ├── otm-selector-debugger.md   Custom agent for fixing broken selectors
+    │   └── otm-tool-builder.md        Custom agent for adding new OTM tools
+    └── commands/
+        └── otm.md                     /otm slash command for quick task runs
+
+
+--------------------------------------------------------------------------------
+FILE 1: browser.js — THE PLAYWRIGHT SESSION MANAGER
+--------------------------------------------------------------------------------
+
+PURPOSE:
+  This file is the only place in the entire project that directly touches the
+  browser. Everything else goes through this file to interact with OTM.
+
+DESIGN PATTERN — SINGLETON:
+  There is one instance of BrowserSession exported as the default export. Every
+  other file that needs to interact with the browser imports this same instance.
+  This means the browser is opened once and reused across all tool calls within
+  a single run, rather than opening and closing a new browser for every action.
+
+  import session from './browser.js';
+
+HOW LOGIN WORKS:
+  When the browser session is initialized, it tries to load a saved session from
+  cookies.json. If that file exists and contains a valid unexpired session, the
+  browser is effectively already logged in — no credentials needed.
+
+  If cookies.json doesn't exist, is corrupted, or the session has expired, the
+  agent calls login(). The login function:
+    1. Navigates to the OTM sign-in page (/users/sign_in)
+    2. Tries multiple CSS selectors for the email field (a list of candidates)
+    3. Fills in the email from process.env.OTM_USER
+    4. Tries multiple CSS selectors for the password field
+    5. Fills in the password from process.env.OTM_PASS
+    6. Clicks the submit button
+    7. Checks that the browser navigated away from the login page
+    8. Saves the new session cookies to cookies.json
+
+  The multi-candidate selector approach is important because OTM might change
+  its HTML structure. By trying several selectors in order, the code is more
+  resilient to minor site updates.
+
+HEADLESS MODE:
+  By default HEADLESS=true, meaning the browser runs invisibly in the
+  background. Setting HEADLESS=false in .env opens a visible browser window so
+  you can watch every action happen in real time. This is invaluable for
+  debugging when something isn't working.
+
+KEY METHODS:
+  session.init()
+    Launches the Chromium browser (once). Loads cookies if available.
+
+  session.ensureLoggedIn()
+    Calls init() if not already done, then checks if we're logged in. If not,
+    calls login(). This is called at the start of every tool handler.
+
+  session.navigate(urlOrPath)
+    Navigates to a URL or relative path (e.g. "/territories"). Waits for the
+    page to finish loading. Returns the final URL (in case of redirects).
+
+  session.scrapeTable(selector)
+    Finds a table on the page and extracts it as structured data:
+    { headers: ['Col1', 'Col2', ...], rows: [['val', 'val'], ...] }
+
+  session.findLinks(textPattern)
+    Returns all <a> tags whose text matches a pattern. Used to find links to
+    specific territory or publisher pages.
+
+  session.getAllElements(selector)
+    Returns an array of { text, html, attrs } objects for all matching elements.
+
+  session.evaluate(fn, ...args)
+    Runs a JavaScript function directly inside the browser page context. Used for
+    extracting data that doesn't have a simple CSS selector.
+
+  session.screenshot()
+    Takes a screenshot of the current page and returns it as a base64-encoded PNG
+    string. Used by the take_screenshot tool so the AI can "see" the page.
+
+  session.click(selector)
+    Clicks an element. Waits for a short settle period after clicking to let
+    any navigation or page re-render complete.
+
+  session.fill(selector, value)
+    Clears an input field and types the given value into it.
+
+  session.close()
+    Saves cookies to cookies.json and closes the browser. Always called in a
+    finally block so cookies are saved even if the task fails partway through.
+
+COOKIE PERSISTENCE — WHY IT MATTERS:
+  OTM requires login. Without saving cookies, the agent would need to log in
+  from scratch on every single run. Saved cookies mean:
+    - Faster startup (no login round-trip)
+    - Less risk of triggering anti-bot measures on the login page
+    - The session behaves like a real returning user
+
+  cookies.json stores not just cookies but also localStorage data, which some
+  modern web apps rely on for session state.
+
+
+--------------------------------------------------------------------------------
+FILE 2: mcp-server.js — OTM TOOLS + MCP SERVER
+--------------------------------------------------------------------------------
+
+PURPOSE:
+  This file has two jobs:
+    1. Define and implement all 13 OTM automation tools.
+    2. Expose those tools as an MCP Server when run directly (node mcp-server.js).
+
+EXPORTS:
+  OTM_TOOLS   — Array of tool definition objects (name, description, inputSchema).
+  callTool()  — Async function that routes a tool name + args to the right handler.
+
+THE 13 TOOLS:
+
+  list_territories
+    Navigates to /territories and scrapes the territory list. Returns a table
+    with headers and rows (territory number, name, status, etc.). Accepts an
+    optional status_filter to narrow results (e.g. "available", "checked out").
+
+  get_territory
+    Takes a territory number (e.g. "42" or "S-42"), navigates to the territory
+    detail page, and returns all available information about that territory
+    including its assignment history.
+
+  search_territories
+    Searches for territories by number, name, city, or any keyword. First tries
+    the URL query parameter (/territories?q=...), then falls back to scraping
+    the full list and filtering locally.
+
+  get_territory_status
+    Returns the current checkout status of a specific territory: who has it,
+    when they checked it out, and how long it's been out. Filters page text for
+    status-related keywords to return only the relevant lines.
+
+  assign_territory
+    The most complex tool. Steps:
+      1. Navigate to the territory's detail page.
+      2. Find and click a "Check Out" or "Assign" button.
+      3. On the resulting form, find the publisher name field (input or select).
+      4. Fill in the publisher's name (or select from dropdown).
+      5. Optionally fill in the checkout date.
+      6. Submit the form.
+      7. Return the result page content to confirm success.
+
+  return_territory
+    Similar to assign_territory. Finds a "Return" button on the territory page,
+    clicks it, optionally fills in a return date, and submits.
+
+  list_publishers
+    Navigates to /publishers and scrapes the publisher list. Accepts an optional
+    group_filter to show only publishers in a specific service group.
+
+  get_publisher
+    Searches for a publisher by name and navigates to their detail page. Returns
+    their territory history and any currently held territories.
+
+  navigate_page
+    A general-purpose tool that navigates the browser to any OTM path or URL.
+    Useful when the AI needs to explore a section of the site that isn't covered
+    by a specific tool.
+
+  get_page_content
+    Returns the current page's URL, title, and all visible text (up to 6000
+    characters). The AI uses this to understand what's on screen before deciding
+    what to click or fill.
+
+  click_element
+    Clicks any element on the current page identified by a CSS selector. Also
+    supports Playwright's "text=" syntax: "text=Submit" clicks the element whose
+    visible text is "Submit".
+
+  fill_form
+    Fills any input field on the current page identified by a CSS selector.
+    Used when the AI needs to interact with a form that isn't handled by a
+    higher-level tool.
+
+  take_screenshot
+    Takes a screenshot of the current browser page and returns it as a base64
+    PNG string. The AI can use this to visually inspect the page when selector-
+    based approaches fail.
+
+THE withBrowser() WRAPPER:
+  Every tool handler is wrapped in this async function:
+
+    async function withBrowser(fn) {
+      try {
+        await session.ensureLoggedIn();
+        return await fn();
+      } catch (err) {
+        return { error: true, message: err.message, stack: ... };
+      }
+    }
+
+  This does two critical things:
+    1. Ensures the browser is initialized and logged in before every action.
+    2. Catches any error and returns it as a data object instead of throwing.
+
+  Returning errors as data (rather than throwing) is essential for the agentic
+  loop. When the AI sees { error: true, message: "Element not found" }, it can
+  reason about what went wrong and try a different approach. If the error was
+  thrown, the whole process would crash.
+
+THE MULTI-SELECTOR PATTERN:
+  For actions like "find the checkout button", the code tries multiple selectors
+  in order and uses whichever works first:
+
+    const checkoutSelectors = [
+      'a:has-text("Check Out")',
+      'a:has-text("Assign")',
+      'button:has-text("Check Out")',
+      '[href*="checkout"]',
+      '[href*="new_assignment"]',
+    ];
+    for (const sel of checkoutSelectors) {
+      try { await session.click(sel); break; } catch {}
+    }
+
+  This makes the code resilient to OTM UI changes without needing to rewrite
+  the whole handler every time a button text or class name changes.
+
+MCP SERVER MODE:
+  When mcp-server.js is run directly (node mcp-server.js), it starts an MCP
+  Server that communicates over stdio (standard input/output). The server:
+    - Responds to "list tools" requests with the OTM_TOOLS array.
+    - Responds to "call tool" requests by routing to callTool().
+    - Returns results as JSON text content.
+
+  This is the standard MCP server pattern. Any MCP client (Claude Desktop,
+  VS Code MCP extension, etc.) connects to this process and can call any of
+  the 13 OTM tools as if they were built-in capabilities.
+
+  When mcp-server.js is imported by index.js rather than run directly, the
+  MCP server startup code is skipped — the file acts as a plain module.
+
+
+--------------------------------------------------------------------------------
+FILE 3: providers.js — THE AI PROVIDER ABSTRACTION
+--------------------------------------------------------------------------------
+
+PURPOSE:
+  Different AI providers have different APIs, different message formats, and
+  different ways of handling tool use (function calling). This file normalizes
+  all of that into one consistent interface so index.js doesn't need to know
+  which provider is being used.
+
+THE PROBLEM IT SOLVES:
+  Anthropic's API and OpenAI's API both support "tool use" (letting the AI call
+  functions), but they do it differently:
+
+  ANTHROPIC:
+    Tool definitions use "input_schema" as the key for the JSON Schema.
+    Tool calls come back as content blocks with type "tool_use".
+    Tool results go back as user messages with type "tool_result".
+
+    Example tool definition:
+      { name: "list_territories", input_schema: { type: "object", ... } }
+
+    Example response content:
+      [{ type: "tool_use", id: "tu_123", name: "list_territories", input: {} }]
+
+    Example tool result message:
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_123", content: "..." }] }
+
+  OPENAI / GROQ:
+    Tool definitions use "parameters" as the key (inside a "function" wrapper).
+    Tool calls come back in message.tool_calls as an array.
+    Arguments are JSON-stringified strings, not objects.
+    Tool results go back as separate messages with role "tool".
+
+    Example tool definition:
+      { type: "function", function: { name: "list_territories", parameters: { type: "object", ... } } }
+
+    Example response:
+      message.tool_calls = [{ id: "call_123", function: { name: "list_territories", arguments: "{}" } }]
+
+    Example tool result message:
+      { role: "tool", tool_call_id: "call_123", content: "..." }
+
+  providers.js handles all these differences internally with:
+    - toAnthropicTools()  converts OTM_TOOLS to Anthropic format
+    - toOpenAITools()     converts OTM_TOOLS to OpenAI/Groq format
+    - Three loop functions, one per provider
+
+THE THREE LOOPS:
+
+  anthropicLoop()
+    Uses the Anthropic SDK. Sends messages with the system prompt and tool
+    definitions. After each response, checks if any tool_use blocks are present.
+    If yes, executes the tools and sends results back as tool_result content.
+    Continues until stop_reason is "end_turn" or no tools were called.
+
+  openaiLoop()
+    Uses the OpenAI SDK. System prompt goes in as a "system" role message.
+    After each response, checks message.tool_calls. Parses the JSON-stringified
+    arguments back into objects. Sends tool results back as individual "tool"
+    role messages. Continues until finish_reason is "stop".
+
+  groqLoop()
+    Identical to openaiLoop() but uses the Groq SDK client. Groq hosts open-
+    source models (Llama, Mixtral) with an OpenAI-compatible API, so the code
+    is essentially the same — just a different client instantiation.
+
+DEFAULT MODELS:
+  anthropic  →  claude-sonnet-4-20250514
+  openai     →  gpt-4o
+  groq       →  llama-3.3-70b-versatile
+
+  These can all be overridden with the --model flag.
+
+THE runAgentLoop() EXPORT:
+  The single public function that index.js calls. Accepts:
+    task          The plain-English task string
+    provider      "anthropic", "openai", or "groq"
+    model         Model name (optional, defaults to DEFAULT_MODELS[provider])
+    systemPrompt  The system prompt text
+    tools         The OTM_TOOLS array
+    callTool      The async dispatch function from mcp-server.js
+    onText        Callback fired when the model outputs text
+    onToolCall    Callback fired before a tool is executed
+    onToolResult  Callback fired after a tool returns a result
+
+  The callback pattern lets index.js handle all console output without
+  providers.js needing to know anything about logging or display.
+
+
+--------------------------------------------------------------------------------
+FILE 4: index.js — THE CLI ENTRY POINT
+--------------------------------------------------------------------------------
+
+PURPOSE:
+  The main script the user runs. Handles CLI argument parsing, task collection,
+  and orchestrates the agentic loop.
+
+CLI FLAGS:
+  --provider / -p   Which AI provider to use (anthropic | openai | groq)
+  --model / -m      Override the default model for the chosen provider
+  --help / -h       Print usage instructions and exit
+
+  If --provider is not given, the AI_PROVIDER environment variable is checked.
+  If that's also not set, it defaults to "anthropic".
+
+TASK INPUT — THREE WAYS:
+  1. CLI argument:  node index.js "Assign territory 7 to John"
+  2. Piped stdin:   echo "List publishers" | node index.js --provider groq
+  3. Interactive:   node index.js  (prompts "Enter OTM task: ")
+
+THE SYSTEM PROMPT:
+  The system prompt tells the AI who it is and how to behave. Key instructions:
+    - Verify state before making changes (don't assign without checking status first)
+    - If a tool returns an error, try an alternative approach
+    - Use get_page_content or take_screenshot when unsure about page structure
+    - Summarize results clearly at the end
+    - Today's date is injected dynamically so the AI can use it for date fields
+
+HOW THE LOOP WORKS (from index.js's perspective):
+  index.js calls runAgentLoop() from providers.js with callbacks for logging.
+  The loop runs inside providers.js until the AI is done. index.js just watches
+  and prints output as the callbacks fire.
+
+  At the very end (in a finally block), session.close() is called to save
+  cookies and shut down the browser cleanly — even if the task failed.
+
+
+--------------------------------------------------------------------------------
+THE AGENTIC LOOP — HOW AI TOOL USE WORKS
+--------------------------------------------------------------------------------
+
+This is the core concept of the whole project. Here's what happens step by step
+when you run a task:
+
+  Step 1: You run: node index.js --provider anthropic "Assign territory 42 to Jane Smith"
+
+  Step 2: index.js reads the task and calls runAgentLoop().
+
+  Step 3: providers.js sends the first message to the AI:
+    - System prompt: "You are an OTM assistant..."
+    - User message: "Assign territory 42 to Jane Smith"
+    - Available tools: all 13 OTM tools with their descriptions and schemas
+
+  Step 4: The AI (Claude/GPT/Llama) thinks about the task and decides it should
+    first check territory 42's current status before assigning it.
+    It responds with a tool_use block:
+      { name: "get_territory_status", input: { territory_number: "42" } }
+
+  Step 5: providers.js sees the tool_use response, calls:
+      callTool("get_territory_status", { territory_number: "42" })
+
+  Step 6: callTool routes to handleGetTerritoryStatus(), which:
+    - Calls session.ensureLoggedIn() (opens browser, loads cookies, checks login)
+    - Calls navigateToTerritory("42") (goes to /territories, finds the link)
+    - Reads the page text and filters for status-related keywords
+    - Returns: { url: "https://...", status_text: "Territory 42 - Available" }
+
+  Step 7: providers.js sends the tool result back to the AI as the next message.
+
+  Step 8: The AI now knows territory 42 is available. It decides to proceed with
+    the assignment and calls:
+      { name: "assign_territory", input: { territory_number: "42", publisher_name: "Jane Smith" } }
+
+  Step 9: callTool routes to handleAssignTerritory(). The handler:
+    - Navigates to territory 42's page
+    - Finds and clicks the "Check Out" button
+    - Fills in "Jane Smith" in the publisher field
+    - Submits the form
+    - Returns the success page content
+
+  Step 10: The AI receives the success result, sees the confirmation text,
+    and responds with a final text message:
+    "Territory 42 has been successfully assigned to Jane Smith."
+
+  Step 11: providers.js sees stop_reason = "end_turn" (no more tool calls).
+    The loop exits.
+
+  Step 12: index.js calls session.close() to save cookies and exit cleanly.
+
+This loop can run up to 20 turns (configurable via MAX_TURNS). If the AI runs
+into an error on one approach, it can try something different on the next turn —
+for example, if clicking by selector fails, it might try get_page_content to
+inspect the page first, then use click_element with a text= selector instead.
+
+
+--------------------------------------------------------------------------------
+THE MCP PROTOCOL — WHAT IT IS AND WHY IT MATTERS
+--------------------------------------------------------------------------------
+
+MCP (Model Context Protocol) is an open standard that defines how AI models
+can discover and call external tools in a uniform way, regardless of which AI
+model or client is being used.
+
+Think of it like USB — before USB, every device had a different connector.
+After USB, one standard port works for everything. MCP is the "USB" for AI
+tools.
+
+HOW THIS PROJECT USES MCP:
+  When you run "node mcp-server.js", the project becomes an MCP Server. Any
+  MCP Client can then connect to it and gain access to all 13 OTM tools.
+
+  The MCP Server communicates via stdio — the client reads from the server's
+  stdout and writes to its stdin. This is the standard transport for local MCP
+  servers.
+
+CLAUDE DESKTOP INTEGRATION:
+  Claude Desktop is an MCP Client. If you add mcp-server.js to Claude Desktop's
+  configuration, you can open Claude Desktop and just say:
+    "List all territories that have been checked out for more than 6 months"
+  ...and Claude Desktop will call the OTM tools directly, without you running
+  any terminal commands.
+
+  Configuration goes in:
+    ~/Library/Application Support/Claude/claude_desktop_config.json
+
+  Add:
+    {
+      "mcpServers": {
+        "otm": {
+          "command": "node",
+          "args": ["/full/path/to/mcp-server.js"],
+          "env": {
+            "OTM_USER": "your@email.com",
+            "OTM_PASS": "yourpassword",
+            "HEADLESS": "true"
+          }
+        }
+      }
+    }
+
+CLI AGENT vs MCP SERVER:
+  The CLI agent (index.js) and the MCP Server (mcp-server.js) both use the
+  same underlying tool implementations. The difference is:
+    - CLI agent: You give it a task in terminal, Claude/GPT/Groq runs the loop.
+    - MCP Server: An external AI client (like Claude Desktop) connects and calls
+      tools on demand as part of its own conversation.
+
+
+--------------------------------------------------------------------------------
+CUSTOM AGENTS — .claude/agents/
+--------------------------------------------------------------------------------
+
+These are specialized AI agent definitions for use within Claude Code (the
+AI coding assistant). They are not separate programs — they are instruction
+files that tell Claude Code how to behave when a specific kind of help is needed.
+
+otm-selector-debugger.md
+  This agent is for when a Playwright selector breaks — e.g. OTM updates its
+  site and the "Check Out" button now has different HTML. The agent:
+    - Reads the current mcp-server.js
+    - Analyzes the HTML you provide
+    - Proposes better or additional selectors
+    - Edits mcp-server.js to add them
+  It knows the multi-selector fallback pattern and follows it correctly.
+
+otm-tool-builder.md
+  This agent is for adding entirely new OTM tools. It knows the three-step
+  process (add to OTM_TOOLS array, write the handler, add to callTool switch)
+  and will do all three in one session. It also knows the code conventions
+  (withBrowser wrapper, error handling, truncation, ES module style).
+
+
+--------------------------------------------------------------------------------
+THE /otm SLASH COMMAND — .claude/commands/otm.md
+--------------------------------------------------------------------------------
+
+This defines a /otm command within Claude Code. When you type /otm in Claude
+Code's interface, it will run node index.js with whatever task you specify.
+It also documents how to use HEADLESS=false for debugging, and how to use
+get_page_content and take_screenshot to diagnose issues from within Claude Code.
+
+
+--------------------------------------------------------------------------------
+ENVIRONMENT VARIABLES — COMPLETE REFERENCE
+--------------------------------------------------------------------------------
+
+OTM_USER
+  Your OTM login email address.
+  Example: myemail@example.com
+
+OTM_PASS
+  Your OTM login password.
+  Example: mysecretpassword
+
+HEADLESS
+  Controls whether the Playwright browser is visible.
+  "true"  = invisible (default, faster, for production use)
+  "false" = visible window (for debugging, watching what happens)
+
+AI_PROVIDER
+  Which AI provider to use by default.
+  Options: anthropic | openai | groq
+  Default: anthropic
+  Can be overridden with --provider flag at runtime.
+
+ANTHROPIC_API_KEY
+  API key from https://console.anthropic.com/
+  Required when using --provider anthropic.
+  Format: sk-ant-api03-...
+
+OPENAI_API_KEY
+  API key from https://platform.openai.com/api-keys
+  Required when using --provider openai.
+  Format: sk-proj-...
+
+GROQ_API_KEY
+  API key from https://console.groq.com/keys
+  Required when using --provider groq.
+  Format: gsk_...
+
+
+--------------------------------------------------------------------------------
+FIRST RUN CHECKLIST
+--------------------------------------------------------------------------------
+
+  [ ] 1. Edit .env — fill in OTM_USER, OTM_PASS, and at least one API key.
+
+  [ ] 2. Run: npx playwright install chromium
+           This downloads the Chromium browser binary (~150MB, one-time).
+
+  [ ] 3. Run: node index.js "Show me all available territories"
+           On first run it will log in and create cookies.json automatically.
+
+  [ ] 4. (Optional) If it fails, run with HEADLESS=false to watch the browser:
+           HEADLESS=false node index.js "Show me all available territories"
+
+
+--------------------------------------------------------------------------------
+COMMON USAGE PATTERNS
+--------------------------------------------------------------------------------
+
+Basic tasks:
+  node index.js "Show me all available territories"
+  node index.js "List all publishers"
+  node index.js "What territories does John Smith have?"
+  node index.js "Show me the status of territory 42"
+
+Making changes:
+  node index.js "Assign territory 42 to Jane Smith"
+  node index.js "Return territory 15"
+  node index.js "Assign territory 7 to Mary Johnson, checked out yesterday"
+
+Choosing a provider:
+  node index.js --provider openai "List all checked-out territories"
+  node index.js --provider groq "Assign territory 3 to Bob"
+  node index.js -p groq -m llama-3.3-70b-versatile "Return territory 9"
+
+Piping tasks:
+  echo "List publishers in group 2" | node index.js --provider groq
+
+Setting a default provider (in .env):
+  AI_PROVIDER=groq
+
+Debugging:
+  HEADLESS=false node index.js "Assign territory 42 to Jane Smith"
+
+Running as MCP Server (for Claude Desktop):
+  node mcp-server.js
+
+Getting help:
+  node index.js --help
+
+
+--------------------------------------------------------------------------------
+HOW TO ADD A NEW AI PROVIDER
+--------------------------------------------------------------------------------
+
+If you want to add support for, say, Google Gemini or AWS Bedrock:
+
+  1. Install the SDK:
+       npm install @google/generative-ai
+
+  2. Open providers.js.
+
+  3. Add the provider name to the PROVIDERS array:
+       export const PROVIDERS = ['anthropic', 'openai', 'groq', 'gemini'];
+
+  4. Add its default model to DEFAULT_MODELS:
+       export const DEFAULT_MODELS = {
+         ...existing...,
+         gemini: 'gemini-1.5-pro',
+       };
+
+  5. Write a geminiLoop() function following the same pattern as openaiLoop().
+     The function receives: { task, model, systemPrompt, tools, callTool,
+     onText, onToolCall, onToolResult }
+     It must translate the provider's tool format, run the loop, and call
+     the callbacks for logging.
+
+  6. Add a case to the switch in runAgentLoop():
+       case 'gemini': return geminiLoop(args);
+
+  7. Add GEMINI_API_KEY to .env.
+
+  That's it. index.js needs no changes.
+
+
+--------------------------------------------------------------------------------
+HOW TO ADD A NEW OTM TOOL
+--------------------------------------------------------------------------------
+
+  1. Open mcp-server.js.
+
+  2. Add a tool definition object to the OTM_TOOLS array:
+       {
+         name: 'my_new_tool',
+         description: 'What this tool does and when to use it.',
+         inputSchema: {
+           type: 'object',
+           properties: {
+             my_param: { type: 'string', description: 'What this param is for.' },
+           },
+           required: ['my_param'],
+         },
+       }
+
+  3. Write the handler function:
+       async function handleMyNewTool({ my_param }) {
+         return withBrowser(async () => {
+           await session.navigate('/some-page');
+           // ... do stuff ...
+           return { result: 'data' };
+         });
+       }
+
+  4. Add a case to the callTool() switch:
+       case 'my_new_tool': return handleMyNewTool(args);
+
+  5. Done. index.js, providers.js, and Claude Desktop all pick it up automatically
+     because they all read from OTM_TOOLS dynamically.
+
+
+--------------------------------------------------------------------------------
+SECURITY NOTES
+--------------------------------------------------------------------------------
+
+.env is in .gitignore
+  Your OTM credentials and API keys are in .env, which is listed in .gitignore.
+  This means git will never commit this file. Never manually add it to a commit.
+
+cookies.json is in .gitignore
+  The saved browser session contains authentication tokens. Committing it would
+  expose your OTM session to anyone with repo access.
+
+API keys are per-provider
+  You only need the API key for the provider(s) you actually use. Leave the
+  others as placeholders.
+
+No credentials in code
+  All credentials come from environment variables (process.env). The code itself
+  contains no secrets.
+
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING GUIDE
+--------------------------------------------------------------------------------
+
+PROBLEM: Login fails even with correct credentials.
+CAUSE:   OTM's login form selectors may have changed, or there's a CAPTCHA.
+FIX:     Run HEADLESS=false to watch the browser. Look at what the page shows.
+         Check whether OTM has added new form fields or changed the submit button.
+         Update the LOGIN_SELECTORS array in browser.js to match.
+
+PROBLEM: "Element not found" error on a tool call.
+CAUSE:   OTM updated their UI and the CSS selectors no longer match.
+FIX:     Run with HEADLESS=false. Add "take_screenshot" to your task to get a
+         visual of what the browser sees. Then update the selector arrays in the
+         relevant tool handler in mcp-server.js.
+
+PROBLEM: The session expires quickly.
+CAUSE:   OTM's session timeout may be short, or cookies.json is stale.
+FIX:     Delete cookies.json to force a fresh login. This happens automatically
+         the next time you run the agent.
+
+PROBLEM: Groq returns tool-use errors or ignores tool calls.
+CAUSE:   Not all Groq models support tool use equally well.
+FIX:     Use llama-3.3-70b-versatile (the default). Alternatively try:
+           --model llama3-groq-70b-8192-tool-use-preview
+         which is specifically optimized for function calling.
+
+PROBLEM: OpenAI rate limit errors.
+CAUSE:   Your OpenAI plan has a low rate limit, or you're hitting it repeatedly.
+FIX:     Use --model gpt-4o-mini for lighter tasks (cheaper, faster, higher RPM).
+         Or switch to groq for unlimited free inference.
+
+PROBLEM: The agent loops without making progress.
+CAUSE:   The AI is confused about the page state and trying different approaches.
+FIX:     Add "take_screenshot" to your task and examine the result. The AI may
+         be navigating to the wrong page. Check session.navigate() paths.
+
+PROBLEM: Tool returns empty or raw HTML instead of structured data.
+CAUSE:   OTM is using a layout the scraper doesn't recognize (not a standard
+         <table>, using JavaScript-rendered content, etc.).
+FIX:     Use get_page_content to inspect the raw text and identify the structure.
+         Then add a new scraping strategy to the relevant tool handler.
+
+
+--------------------------------------------------------------------------------
+END OF OVERVIEW
+================================================================================
