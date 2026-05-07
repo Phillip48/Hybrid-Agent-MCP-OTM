@@ -375,6 +375,46 @@ bot.command('myid', async (ctx) => {
   await ctx.reply(`Your Telegram ID: \`${ctx.from.id}\``, { parse_mode: 'Markdown' });
 });
 
+bot.command('debug', async (ctx) => {
+  const userId = String(ctx.from.id);
+  log(userId, '/debug — testing session');
+  const msg = await ctx.reply('⏳ Testing OTM session...');
+  const stopTyping = startTyping(ctx);
+
+  try {
+    const user = await getUser(userId);
+    if (!user?.registered) {
+      stopTyping();
+      await safeEdit(ctx, msg.message_id, '❌ Not registered. Run /setup first.');
+      return;
+    }
+
+    const browserSession = sessionManager.getOrCreate(userId, {
+      otmUser: user.otmUser,
+      otmPass: user.otmPass,
+    });
+
+    log(userId, 'Calling ensureLoggedIn');
+    await browserSession.ensureLoggedIn();
+    const url = await browserSession.getCurrentUrl();
+    log(userId, `Session URL after login: ${url}`);
+
+    // Try navigating to the territory list to confirm full access.
+    const landed = await browserSession.navigate('/GetStandard.php');
+    const pageText = await browserSession.evaluate(() => document.title + ' | ' + document.body.innerText.slice(0, 200));
+
+    stopTyping();
+    log(userId, `Debug complete. Landed: ${landed}`);
+    await safeEdit(ctx, msg.message_id,
+      `✅ Session active\nURL: ${landed}\nPage: ${pageText.slice(0, 300)}`
+    );
+  } catch (e) {
+    stopTyping();
+    err(userId, 'Debug failed:', e.message);
+    await safeEdit(ctx, msg.message_id, `❌ Session error: ${e.message}`);
+  }
+});
+
 bot.command('setprovider', async (ctx) => {
   const userId = String(ctx.from.id);
   const parts  = ctx.message.text.trim().split(/\s+/);

@@ -124,6 +124,18 @@ export class BrowserSession {
     await this.ensureLoggedIn();
     const url = urlOrPath.startsWith('http') ? urlOrPath : `${OTM_BASE}${urlOrPath}`;
     await this.page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+
+    // If OTM redirected us back to the login page, the session expired mid-task.
+    // Re-login and retry the navigation once.
+    const landed = this.page.url();
+    const onLogin = landed === OTM_BASE || landed === OTM_BASE + '/'
+      || await this.page.evaluate(() => !!document.querySelector('form#mainform, input[name="username"]'));
+    if (onLogin) {
+      console.log(`[browser:${this.userId}] Session expired — re-logging in`);
+      await this.login();
+      await this.page.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+    }
+
     return this.page.url();
   }
 
