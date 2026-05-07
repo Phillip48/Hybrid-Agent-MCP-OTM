@@ -4,21 +4,29 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const COOKIES_PATH = path.join(__dirname, 'cookies.json');
 export const OTM_BASE = 'https://onlineterritorymanager.com';
 
-// Candidate selectors tried in order for each login field.
 const LOGIN_SELECTORS = {
-  email: ['#user_email', 'input[name="user[email]"]', 'input[type="email"]', 'input[name="email"]'],
-  password: ['#user_password', 'input[name="user[password]"]', 'input[type="password"]', 'input[name="password"]'],
-  submit: ['input[type="submit"]', 'button[type="submit"]', 'button:has-text("Sign in")', 'button:has-text("Log in")'],
+  email:    ['#username', 'input[name="username"]', 'input[type="username"]', 'input[type="email"]', 'input[name="email"]'],
+  password: ['#password', 'input[name="password"]', 'input[type="password"]'],
+  submit:   ['button[name="submit-login"]', 'button[type="submit"]', 'input[type="submit"]'],
 };
 
-class BrowserSession {
-  constructor() {
-    this.browser = null;
-    this.context = null;
-    this.page = null;
+export class BrowserSession {
+  /**
+   * @param {object} [opts]
+   * @param {string} [opts.userId='default']  Used to namespace the cookies file.
+   * @param {string} [opts.otmUser]           OTM email — falls back to OTM_USER env var.
+   * @param {string} [opts.otmPass]           OTM password — falls back to OTM_PASS env var.
+   */
+  constructor({ userId = 'default', otmUser, otmPass } = {}) {
+    this.userId      = userId;
+    this.otmUser     = otmUser ?? process.env.OTM_USER;
+    this.otmPass     = otmPass ?? process.env.OTM_PASS;
+    this.cookiesPath = path.join(__dirname, 'cookies', `${userId}.json`);
+    this.browser     = null;
+    this.context     = null;
+    this.page        = null;
     this._loginInProgress = false;
   }
 
@@ -29,47 +37,40 @@ class BrowserSession {
 
     let storageState;
     try {
-      const raw = await fs.readFile(COOKIES_PATH, 'utf-8');
+      const raw = await fs.readFile(this.cookiesPath, 'utf-8');
       storageState = JSON.parse(raw);
-    } catch {
-      // No saved session — start fresh.
-    }
+    } catch {}
 
     this.context = await this.browser.newContext({
       storageState,
-      userAgent:
-        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
       viewport: { width: 1280, height: 900 },
     });
-
     this.page = await this.context.newPage();
     this.page.setDefaultTimeout(20000);
   }
 
   async saveCookies() {
     try {
+      await fs.mkdir(path.dirname(this.cookiesPath), { recursive: true });
       const state = await this.context.storageState();
-      await fs.writeFile(COOKIES_PATH, JSON.stringify(state, null, 2));
+      await fs.writeFile(this.cookiesPath, JSON.stringify(state, null, 2));
     } catch (err) {
-      console.error('[browser] Failed to save cookies:', err.message);
+      console.error(`[browser:${this.userId}] Failed to save cookies:`, err.message);
     }
   }
 
-  // Returns true when the current page looks like a logged-in dashboard.
   async isLoggedIn() {
     try {
       const url = this.page.url();
-      // If we're already on a non-login page assume logged in.
-      if (!url.includes('sign_in') && !url.includes('login') && url.includes(OTM_BASE)) {
-        return true;
-      }
-      // Do a lightweight probe of the territories path.
-      const resp = await this.page.goto(`${OTM_BASE}/territories`, {
-        waitUntil: 'domcontentloaded',
-        timeout: 15000,
-      });
+      // If we're already on a page deeper than the root we're likely logged in.
+      const isRoot = url === OTM_BASE || url === OTM_BASE + '/';
+      if (url.startsWith(OTM_BASE) && !isRoot) return true;
+      // Otherwise probe /territories — if we get redirected back to root, session is gone.
+      const resp   = await this.page.goto(`${OTM_BASE}/GetStandard.php`, { waitUntil: 'domcontentloaded', timeout: 15000 });
       const landed = this.page.url();
-      return !!resp && resp.ok() && !landed.includes('sign_in') && !landed.includes('login');
+      const landedIsRoot = landed === OTM_BASE || landed === OTM_BASE + '/';
+      return !!resp && resp.ok() && !landedIsRoot;
     } catch {
       return false;
     }
@@ -79,21 +80,18 @@ class BrowserSession {
     if (this._loginInProgress) return;
     this._loginInProgress = true;
     try {
-      await this.page.goto(`${OTM_BASE}/users/sign_in`, { waitUntil: 'domcontentloaded' });
+      if (!this.otmUser || !this.otmPass) throw new Error('OTM credentials not set for this session.');
+      await this.page.goto(OTM_BASE, { waitUntil: 'domcontentloaded' });
 
-      // Try each candidate selector in order.
       const fillFirst = async (candidates, value) => {
         for (const sel of candidates) {
-          try {
-            await this.page.fill(sel, value, { timeout: 3000 });
-            return;
-          } catch {}
+          try { await this.page.fill(sel, value, { timeout: 3000 }); return; } catch {}
         }
-        throw new Error(`Could not find input field among: ${candidates.join(', ')}`);
+        throw new Error(`Could not find input among: ${candidates.join(', ')}`);
       };
 
-      await fillFirst(LOGIN_SELECTORS.email, process.env.OTM_USER);
-      await fillFirst(LOGIN_SELECTORS.password, process.env.OTM_PASS);
+      await fillFirst(LOGIN_SELECTORS.email, this.otmUser);
+      await fillFirst(LOGIN_SELECTORS.password, this.otmPass);
 
       for (const sel of LOGIN_SELECTORS.submit) {
         try {
@@ -106,8 +104,8 @@ class BrowserSession {
       }
 
       const url = this.page.url();
-      if (url.includes('sign_in') || url.includes('login')) {
-        throw new Error('Login failed — still on login page. Check OTM_USER / OTM_PASS.');
+      if (url === OTM_BASE || url === OTM_BASE + '/') {
+        throw new Error('Login failed — still on login page. Check your OTM credentials.');
       }
       await this.saveCookies();
     } finally {
@@ -117,12 +115,10 @@ class BrowserSession {
 
   async ensureLoggedIn() {
     await this.init();
-    if (!(await this.isLoggedIn())) {
-      await this.login();
-    }
+    if (!(await this.isLoggedIn())) await this.login();
   }
 
-  // ── High-level actions used by MCP tools ────────────────────────────────────
+  // ── Actions ────────────────────────────────────────────────────────────────
 
   async navigate(urlOrPath) {
     await this.ensureLoggedIn();
@@ -131,15 +127,9 @@ class BrowserSession {
     return this.page.url();
   }
 
-  async getPageContent() {
-    return this.page.content();
-  }
+  async getPageContent() { return this.page.content(); }
+  async getCurrentUrl()  { return this.page.url(); }
 
-  async getCurrentUrl() {
-    return this.page.url();
-  }
-
-  // Returns { text, html } for the first matching element.
   async getElement(selector) {
     const el = await this.page.$(selector);
     if (!el) throw new Error(`Element not found: ${selector}`);
@@ -147,77 +137,75 @@ class BrowserSession {
     return { text: text?.trim(), html };
   }
 
-  // Returns array of { text, html, attrs } for all matching elements.
   async getAllElements(selector) {
     const els = await this.page.$$(selector);
-    return Promise.all(
-      els.map(async (el) => {
-        const text = (await el.textContent())?.trim();
-        const html = await el.innerHTML();
-        const attrs = await el.evaluate((node) => {
-          const result = {};
-          for (const attr of node.attributes) result[attr.name] = attr.value;
-          return result;
-        });
-        return { text, html, attrs };
-      }),
-    );
+    return Promise.all(els.map(async (el) => {
+      const text  = (await el.textContent())?.trim();
+      const html  = await el.innerHTML();
+      const attrs = await el.evaluate((node) => {
+        const r = {};
+        for (const a of node.attributes) r[a.name] = a.value;
+        return r;
+      });
+      return { text, html, attrs };
+    }));
   }
 
   async click(selector) {
     await this.page.click(selector, { timeout: 10000 });
-    // Brief settle after click to let any navigation or re-render finish.
     await this.page.waitForLoadState('domcontentloaded').catch(() => {});
   }
 
-  async fill(selector, value) {
-    await this.page.fill(selector, value, { timeout: 10000 });
-  }
-
-  async select(selector, value) {
-    await this.page.selectOption(selector, value, { timeout: 10000 });
-  }
-
-  // Run arbitrary JS in the page context.
-  async evaluate(fn, ...args) {
-    return this.page.evaluate(fn, ...args);
-  }
+  async fill(selector, value)  { await this.page.fill(selector, value, { timeout: 10000 }); }
+  async select(selector, value){ await this.page.selectOption(selector, value, { timeout: 10000 }); }
+  async evaluate(fn, ...args)  { return this.page.evaluate(fn, ...args); }
 
   async waitForSelector(selector, timeout = 10000) {
     return this.page.waitForSelector(selector, { timeout });
   }
 
-  async waitForText(text, timeout = 10000) {
-    return this.page.waitForSelector(`text=${text}`, { timeout });
+  async scrapeTable(tableSelector = 'table') {
+    return this.page.evaluate((sel) => {
+      const table = document.querySelector(sel);
+      if (!table) return null;
+      const headers = [...table.querySelectorAll('thead th, thead td')].map(th => th.textContent.trim());
+      const rows    = [...table.querySelectorAll('tbody tr')].map(tr =>
+        [...tr.querySelectorAll('td')].map(td => td.textContent.trim()));
+      return { headers, rows };
+    }, tableSelector);
   }
 
-  // Returns base64 PNG screenshot (useful for debugging via MCP).
+  async findLinks(textPattern) {
+    return this.page.evaluate((pat) => {
+      const re = new RegExp(pat, 'i');
+      return [...document.querySelectorAll('a')]
+        .filter(a => re.test(a.textContent))
+        .map(a => ({ text: a.textContent.trim(), href: a.href }));
+    }, textPattern);
+  }
+
+  /**
+   * Navigate to a page by clicking the first nav/menu link whose text matches
+   * the pattern. Throws if no matching link is found.
+   * @param {string} textPattern  e.g. 'territor', 'publisher'
+   */
+  async navigateByLinkText(textPattern) {
+    await this.ensureLoggedIn();
+    const links = await this.findLinks(textPattern);
+    if (links.length > 0) {
+      await this.page.goto(links[0].href, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      return this.page.url();
+    }
+    throw new Error(`Could not find a "${textPattern}" link on the page. Use get_page_content to see what links are available.`);
+  }
+
   async screenshot() {
     const buf = await this.page.screenshot({ type: 'png' });
     return buf.toString('base64');
   }
 
-  // Extract structured table data from the page.
-  async scrapeTable(tableSelector = 'table') {
-    return this.page.evaluate((sel) => {
-      const table = document.querySelector(sel);
-      if (!table) return null;
-      const headers = [...table.querySelectorAll('thead th, thead td')].map((th) => th.textContent.trim());
-      const rows = [...table.querySelectorAll('tbody tr')].map((tr) =>
-        [...tr.querySelectorAll('td')].map((td) => td.textContent.trim()),
-      );
-      return { headers, rows };
-    }, tableSelector);
-  }
-
-  // Find all links whose text matches a pattern.
-  async findLinks(textPattern) {
-    return this.page.evaluate((pat) => {
-      const re = new RegExp(pat, 'i');
-      return [...document.querySelectorAll('a')]
-        .filter((a) => re.test(a.textContent))
-        .map((a) => ({ text: a.textContent.trim(), href: a.href }));
-    }, textPattern);
+  async clearCookies() {
+    try { await fs.unlink(this.cookiesPath); } catch {}
   }
 
   async close() {
@@ -225,10 +213,10 @@ class BrowserSession {
     await this.browser?.close();
     this.browser = null;
     this.context = null;
-    this.page = null;
+    this.page    = null;
   }
 }
 
-// Singleton — shared across all tool invocations in a process.
+// Singleton for the CLI (uses OTM_USER / OTM_PASS from env).
 const session = new BrowserSession();
 export default session;

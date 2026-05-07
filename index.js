@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 /**
  * OTM Agent CLI
  *
@@ -18,7 +17,7 @@ import { OTM_TOOLS, callTool } from './mcp-server.js';
 import { runAgentLoop, PROVIDERS, DEFAULT_MODELS } from './providers.js';
 import session from './browser.js';
 
-// ── CLI argument parsing ──────────────────────────────────────────────────────
+// ── CLI argument parsing ──────────────────────────────────────────────────────Jus
 
 function parseArgs(argv) {
   const args = argv.slice(2);

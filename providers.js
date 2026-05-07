@@ -1,17 +1,6 @@
-/**
- * providers.js — Unified AI provider abstraction
- *
- * Normalizes the Anthropic, OpenAI, and Groq SDK interfaces into a single
- * `runAgentLoop` function so index.js stays provider-agnostic.
- *
- * Supported providers:  anthropic | openai | groq
- */
-
 import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import Groq from 'groq-sdk';
-
-// ── Defaults ─────────────────────────────────────────────────────────────────
 
 export const PROVIDERS = ['anthropic', 'openai', 'groq'];
 
@@ -25,9 +14,6 @@ const MAX_TURNS = 20;
 
 // ── Tool format converters ────────────────────────────────────────────────────
 
-// OTM_TOOLS use Anthropic's `inputSchema` key.
-// Convert to the format each provider expects.
-
 function toAnthropicTools(tools) {
   return tools.map((t) => ({
     name: t.name,
@@ -36,7 +22,6 @@ function toAnthropicTools(tools) {
   }));
 }
 
-// OpenAI and Groq share the same function-calling schema.
 function toOpenAITools(tools) {
   return tools.map((t) => ({
     type: 'function',
@@ -48,7 +33,7 @@ function toOpenAITools(tools) {
   }));
 }
 
-// ── Shared helpers ───────────────────────────────────────────────────────────
+// Helpers
 
 function truncate(text, max = 8000) {
   return text.length > max ? text.slice(0, max) + '\n... [truncated]' : text;
@@ -65,8 +50,6 @@ async function executeToolCalls(toolCalls, callTool, onToolCall, onToolResult) {
     }),
   );
 }
-
-// ── Anthropic loop ───────────────────────────────────────────────────────────
 
 async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult }) {
   const client = new Anthropic();
@@ -107,8 +90,6 @@ async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onTex
     if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
   }
 }
-
-// ── OpenAI loop ──────────────────────────────────────────────────────────────
 
 async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult }) {
   const client = new OpenAI();
@@ -154,9 +135,6 @@ async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, 
   }
 }
 
-// ── Groq loop ────────────────────────────────────────────────────────────────
-// Groq's SDK is OpenAI-compatible — same message/tool format, different client.
-
 async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult }) {
   const client = new Groq();
   const formattedTools = toOpenAITools(tools);
@@ -199,8 +177,6 @@ async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, on
     if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
   }
 }
-
-// ── Public API ───────────────────────────────────────────────────────────────
 
 /**
  * Run the full agentic loop for a given provider.

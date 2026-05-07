@@ -1,4 +1,8 @@
 node_modules/
 cookies.json
+cookies/
+data/
 .env
 *.png
+.claude/*
+.claude
