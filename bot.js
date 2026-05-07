@@ -96,7 +96,17 @@ async function handleSetupStep(ctx, userId, text) {
       log(userId, 'Test login successful — saving credentials');
 
       await setUser(userId, { otmUser: state.data.otmUser, otmPass, registered: true });
+
+      // Destroy any stale session, then pre-build and authenticate the real one
+      // so the first task doesn't have to wait for a cold login.
       await sessionManager.destroy(userId);
+      log(userId, 'Pre-authenticating real session');
+      const realSession = sessionManager.getOrCreate(userId, {
+        otmUser: state.data.otmUser,
+        otmPass,
+      });
+      await realSession.ensureLoggedIn();
+      log(userId, 'Pre-auth complete — session is ready');
 
       stopTyping();
       log(userId, 'Setup complete');
@@ -202,7 +212,13 @@ MyTer.php?showallmyter=0 shows only the logged-in user's checked-out territories
 MyTer.php?showallmyter=1 shows ALL checked-out territories (admin view).
 
 ## Today's date: ${new Date().toISOString().split('T')[0]}
-## Response style: Be concise. State exactly what you did and the final outcome. Do not explain steps you are about to take — just do them and report the result.`;
+
+## Critical Rules — READ CAREFULLY
+- ALWAYS call the tools. NEVER respond with instructions for the user to follow manually. You have browser access — use it.
+- If a tool returns { error: true, message: "..." }, quote the exact message back to the user. Do NOT paraphrase it as "authentication" or "login" issues — just report what the tool said.
+- If a tool returns data that looks like a login page (contains "Please Login" or "username" fields), call navigate_page with "/GetStandard.php" to force a fresh login, then retry the original tool.
+- NEVER say "you would need to log in" or "you would need to navigate to...". You are the one doing it. Do it.
+- If a report tool fails, try list_territories or get_page_content to verify the session is active, then retry.`;
 
 async function runTask(ctx, userId, task) {
   if (activeTasks.has(userId)) {

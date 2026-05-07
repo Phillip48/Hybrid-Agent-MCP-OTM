@@ -6,3 +6,4 @@ data/
 *.png
 .claude/*
 .claude
+bot.txt
