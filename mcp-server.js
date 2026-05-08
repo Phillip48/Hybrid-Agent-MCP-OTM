@@ -874,17 +874,16 @@ export function createCallTool(session) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
-  // Nominatim geocoder — tries multiple query forms to maximize hit rate.
+  // Nominatim geocoder — tries multiple query forms with delays between attempts.
   // Uses a Central Florida viewbox to bias ambiguous results to the right area.
-  // Respects the 1-req/sec rate limit via caller-side sleep.
   async function nominatimGeocode(rawAddress) {
-    // Central Florida bounding box (roughly Orange/Osceola/Polk counties)
-    const VIEWBOX = '-82.0,28.0,-80.7,28.9';
+    const VIEWBOX  = '-82.0,28.0,-80.7,28.9';
+    const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
 
     async function tryQuery(q) {
       try {
         const url  = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&viewbox=${VIEWBOX}&bounded=0&countrycodes=us`;
-        const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(10000) });
+        const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(7000) });
         const data = await resp.json();
         if (data.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
       } catch {}
@@ -893,33 +892,25 @@ export function createCallTool(session) {
 
     // Strip unit designators (APT 2, UNIT B, #4, STE 100, etc.) for a cleaner query.
     const stripped = rawAddress.replace(/\s+(apt|unit|ste|suite|#|lot)\s*\S+/gi, '').trim();
+    const withFL   = (q) => /\bfl\b|\bflorida\b/i.test(q) ? q : `${q}, FL`;
+    const parts    = rawAddress.split(',').map(p => p.trim()).filter(Boolean);
 
-    // Ensure Florida context is present.
-    const withFL = (q) => q.toLowerCase().includes('fl') || q.toLowerCase().includes('florida') ? q : `${q}, FL`;
-
-    // Strategy 1: full address with FL hint
-    let result = await tryQuery(withFL(rawAddress));
-    if (result) return result;
-
-    // Strategy 2: stripped of unit number
-    if (stripped !== rawAddress) {
-      result = await tryQuery(withFL(stripped));
-      if (result) return result;
-    }
-
-    // Strategy 3: extract just "number street, city, FL" — drop everything after last comma pair
-    const parts = rawAddress.split(',').map(p => p.trim()).filter(Boolean);
+    // Build the strategy list, skipping duplicates.
+    const queries = [];
+    queries.push(withFL(rawAddress));
+    if (stripped !== rawAddress) queries.push(withFL(stripped));
     if (parts.length >= 2) {
-      const simplified = `${parts[0]}, ${parts[parts.length - 1].replace(/fl\b/i, '').trim()}, FL`;
-      result = await tryQuery(simplified);
+      const simplified = `${parts[0]}, ${parts[parts.length - 1].replace(/\bfl\b/i, '').trim()}, FL`;
+      if (!queries.includes(simplified)) queries.push(simplified);
+    }
+    const fallback = `${parts[0] || rawAddress}, Kissimmee, FL`;
+    if (!queries.includes(fallback)) queries.push(fallback);
+
+    for (let i = 0; i < queries.length; i++) {
+      if (i > 0) await sleep(1000); // respect Nominatim rate limit between fallback attempts
+      const result = await tryQuery(queries[i]);
       if (result) return result;
     }
-
-    // Strategy 4: street address + Kissimmee FL as fallback city
-    const streetOnly = parts[0] || rawAddress;
-    result = await tryQuery(`${streetOnly}, Kissimmee, FL`);
-    if (result) return result;
-
     return null;
   }
 
@@ -1000,6 +991,8 @@ export function createCallTool(session) {
           failed.push(addr);
         }
         geocoded.push({ id: liItems[i].id, addr, dist, coords });
+        // Always wait 1s after each address (nominatimGeocode already waits 1s between
+        // its internal fallback attempts, so this covers the gap for successful first-tries).
         if (i < liItems.length - 1) await sleep(1000);
       }
 
