@@ -874,23 +874,11 @@ export function createCallTool(session) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
-  // US Census Geocoder — free, no rate limit, parallel-safe, US addresses only.
-  async function censusGeocode(address) {
-    try {
-      const url  = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(address)}&benchmark=2020&format=json`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(6000) });
-      const data = await resp.json();
-      const match = data?.result?.addressMatches?.[0];
-      if (match) return { lat: match.coordinates.y, lon: match.coordinates.x };
-    } catch {}
-    return null;
-  }
-
-  // Nominatim fallback — slower, 1 req/sec rate limit.
+  // Nominatim geocoder — sequential with delay to respect rate limit.
   async function nominatimGeocode(address) {
     try {
       const url  = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
-      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0 (territory routing)' }, signal: AbortSignal.timeout(8000) });
+      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(8000) });
       const data = await resp.json();
       if (data.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
     } catch {}
@@ -955,37 +943,19 @@ export function createCallTool(session) {
         return li.text.replace(/^\d+:\s*/, '').replace(/[\s,]*\*?\s*$/, '').trim();
       });
 
-      // ── Step 5: Geocode all addresses in parallel using US Census API ──────
-      // Census is free, no rate limit, and returns results in ~1-3s total.
-      // Falls back to Nominatim (sequential, 800ms delay) for any that fail.
-      console.log(`[route] Geocoding ${liItems.length} addresses via Census API (parallel)...`);
-
-      const geocoded = await Promise.all(
-        liItems.map(async (li, i) => {
-          const addr  = cleanAddresses[i];
-          const query = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
-          const coords = await censusGeocode(query);
-          const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
-          console.log(`[route] ${coords ? '✓' : '✗'} ${addr} — ${dist === 9999 ? 'no coords' : dist.toFixed(1) + 'km'}`);
-          return { id: li.id, addr, dist, coords };
-        })
-      );
-
-      // Fallback: retry failed addresses with Nominatim (sequential to respect rate limit).
+      // ── Step 5: Geocode addresses via Nominatim (sequential, 700ms gap) ──
       const sleep   = (ms) => new Promise(r => setTimeout(r, ms));
-      const failed  = geocoded.filter(g => !g.coords);
-      if (failed.length > 0) {
-        console.log(`[route] ${failed.length} address(es) failed Census — retrying with Nominatim`);
-        for (const entry of failed) {
-          const query  = entry.addr.toLowerCase().includes('fl') ? entry.addr : `${entry.addr}, FL`;
-          const coords = await nominatimGeocode(query);
-          if (coords) {
-            entry.coords = coords;
-            entry.dist   = haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon);
-            console.log(`[route] Nominatim fallback ✓ ${entry.addr} — ${entry.dist.toFixed(1)}km`);
-          }
-          await sleep(800);
-        }
+      const geocoded = [];
+      console.log(`[route] Geocoding ${liItems.length} addresses...`);
+
+      for (let i = 0; i < liItems.length; i++) {
+        const addr  = cleanAddresses[i];
+        const query = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
+        const coords = await nominatimGeocode(query);
+        const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
+        console.log(`[route] ${i + 1}/${liItems.length} ${coords ? '✓' : '✗'} ${addr}`);
+        geocoded.push({ id: liItems[i].id, addr, dist, coords });
+        if (i < liItems.length - 1) await sleep(700);
       }
 
       // ── Step 6: Sort closest → farthest from home base ───────────────
@@ -994,9 +964,11 @@ export function createCallTool(session) {
       console.log(`[route] Closest: ${geocoded[0].addr} (${geocoded[0].dist.toFixed(1)}km)`);
       console.log(`[route] Farthest: ${geocoded.at(-1).addr} (${geocoded.at(-1).dist.toFixed(1)}km)`);
 
-      // ── Step 7: Reorder #dragbox DOM in sorted order ──────────────────
-      // appendChild() moves each <li> to the end — result is the sorted sequence.
+      // ── Step 7: Disable jQuery UI Sortable then reorder #dragbox DOM ────
+      // Disabling Sortable prevents jQuery from overriding our DOM manipulation.
       await session.evaluate((ids) => {
+        // Disable jQuery UI Sortable so it doesn't interfere with appendChild.
+        try { window.jQuery('#dragbox').sortable('disable'); } catch {}
         const parent = document.getElementById('dragbox');
         for (const id of ids) {
           const li = document.getElementById(id);
@@ -1004,41 +976,38 @@ export function createCallTool(session) {
         }
       }, sortedIds);
 
-      // ── Step 8: Call dosave() explicitly then verify RouteOrder ─────────
-      // dosave() reads the current DOM order of #dragbox LI children and writes
-      // their IDs as a comma-separated list into the RouteOrder hidden field.
+      // Verify DOM order matches our sorted IDs.
+      const domOrder = await session.evaluate(() =>
+        [...document.querySelectorAll('#dragbox li')].map(li => li.id)
+      );
+      console.log(`[route] DOM reorder verified — first 3: ${domOrder.slice(0, 3).join(', ')}`);
+
+      // ── Step 8: Call dosave() to populate RouteOrder from DOM order ──────
+      // dosave() reads #dragbox li children in order and writes IDs to RouteOrder.
       await session.evaluate(() => { dosave(); });
 
       const routeOrder = await session.evaluate(() =>
         document.getElementById('RouteOrder').value
       );
       const routeIds = routeOrder.split(',').filter(Boolean);
-      console.log(`[route] RouteOrder populated — ${routeIds.length} IDs: ${routeOrder.slice(0, 80)}…`);
+      console.log(`[route] RouteOrder: ${routeIds.length} IDs — ${routeOrder.slice(0, 80)}…`);
 
       if (!routeOrder) {
-        return { error: true, message: 'RouteOrder field is empty after dosave() — DOM reorder may have failed.' };
+        return { error: true, message: 'RouteOrder is empty after dosave(). DOM reorder may have failed.' };
       }
 
-      // ── Step 9: Submit the form programmatically with Save action ────────
-      // form.submit() does NOT include the clicked button's name/value, so we
-      // inject a hidden input named "Save" so OTM's PHP knows it's a save request
-      // (not Cancel or Back). This is more reliable than Playwright clicking the
-      // submit button because onclick timing can interfere with form.submit().
-      console.log(`[route] Submitting form with Save action`);
-      await session.evaluate(() => {
-        const form = document.getElementById('mainform2');
-        // Inject Save button value so PHP receives $_POST['Save'] = 'Save Route'.
-        const hidden  = document.createElement('input');
-        hidden.type   = 'hidden';
-        hidden.name   = 'Save';
-        hidden.value  = 'Save Route';
-        form.appendChild(hidden);
-        form.submit();
-      });
-      await session.page.waitForLoadState('networkidle').catch(() => {});
-
-      const resultText = await session.evaluate(() => document.body.innerText);
-      console.log(`[route] Post-save page: ${resultText.slice(0, 150)}`);
+      // ── Step 9: Click Save Route using Playwright's native click ─────────
+      // IMPORTANT: do NOT use evaluate() + form.submit() here — that triggers
+      // a navigation which destroys the execution context mid-evaluate and throws
+      // "execution context was destroyed". session.page.click() handles navigation
+      // correctly. The button's onclick fires dosave() again (harmless — DOM is
+      // already sorted so it produces the same RouteOrder).
+      console.log(`[route] Clicking Save Route`);
+      await Promise.all([
+        session.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 15000 }),
+        session.page.click('input[name="Save"]'),
+      ]);
+      console.log(`[route] Navigation complete after save`);
 
       // ── Step 10: Verify the territory is now marked as routed ────────────
       // Navigate back to the selection page and check if the territory option
