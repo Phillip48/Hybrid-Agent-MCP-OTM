@@ -236,22 +236,35 @@ export const OTM_TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
 
+  // ── Route territory ────────────────────────────────────────────────────────
+  {
+    name: 'route_territory',
+    description: 'Routes a territory by sorting its addresses from closest to farthest from the congregation home base (1675 Jack Calhoun Dr, Kissimmee FL). Navigates to TerRoute.php, selects the territory, clicks Edit Route, geocodes each address, reorders them by distance, and saves.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        territory_number: { type: 'string', description: 'Territory number to route, e.g. "OR-15A".' },
+      },
+      required: ['territory_number'],
+    },
+  },
+
   // ── Address entry ──────────────────────────────────────────────────────────
   {
     name: 'add_address',
-    description: 'Adds a new address to OTM. First checks if the address already exists in AddrSearch.php. If it does, returns the existing record. If not, navigates to AdminSingleAddr.php and fills out the form.',
+    description: 'Adds a new address to OTM. Checks for duplicates in AddrSearch.php first. If not found, fills AdminSingleAddr.php with the address details, sets language to Portuguese, clicks Get Lat/Long, then saves. Territory and address type are left as default (NA / Residential).',
     inputSchema: {
       type: 'object',
       properties: {
         street_number: { type: 'string', description: 'House/building number, e.g. "123".' },
         street_name:   { type: 'string', description: 'Street name, e.g. "Main St".' },
         unit:          { type: 'string', description: 'Apt/unit number (optional).' },
-        city:          { type: 'string', description: 'City name.' },
-        state:         { type: 'string', description: 'State abbreviation, e.g. "FL".' },
-        zip:           { type: 'string', description: 'Zip code.' },
-        territory:     { type: 'string', description: 'Territory number to assign the address to (optional).' },
+        city:          { type: 'string', description: 'City name. If not provided, the tool will attempt to look it up.' },
+        state:         { type: 'string', description: 'State abbreviation. Defaults to "FL".' },
+        zip:           { type: 'string', description: 'Zip code. If not provided, the tool will attempt to look it up.' },
+        confirmed:     { type: 'boolean', description: 'Mark the address as confirmed. Default false.' },
       },
-      required: ['street_number', 'street_name', 'city'],
+      required: ['street_number', 'street_name'],
     },
   },
 ];
@@ -293,6 +306,7 @@ export function createCallTool(session) {
     addrEntry:        '/AdminSingleAddr.php',
     dupChecker:       '/DupChecker.php',
     // Territory admin
+    terRoute:         '/TerRoute.php',
     terGroups:        '/TerGroupAdmin.php',
     terTypes:         '/TerTypeAdmin.php',
     campaigns:        '/CampaignAdmin.php',
@@ -846,112 +860,305 @@ export function createCallTool(session) {
     });
   }
 
-  async function handleAddAddress({ street_number, street_name, unit, city, state, zip, territory } = {}) {
+  // ── Route territory ──────────────────────────────────────────────────────────
+
+  // Home base coordinates — 1675 Jack Calhoun Dr, Kissimmee FL 34741
+  const HOME_LAT = 28.307192;
+  const HOME_LON = -81.422605;
+
+  function haversineKm(lat1, lon1, lat2, lon2) {
+    const R    = 6371;
+    const dLat = (lat2 - lat1) * Math.PI / 180;
+    const dLon = (lon2 - lon1) * Math.PI / 180;
+    const a    = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180)*Math.cos(lat2*Math.PI/180)*Math.sin(dLon/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  }
+
+  async function nominatimGeocode(address) {
+    try {
+      const url  = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
+      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0 (territory routing)' } });
+      const data = await resp.json();
+      if (data.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+    } catch {}
+    return null;
+  }
+
+  async function handleRouteTerritory({ territory_number }) {
+    return withBrowser(async () => {
+      console.log(`[route] Starting route for territory ${territory_number}`);
+
+      // ── Step 1: Select territory and click Edit Route ─────────────────
+      await session.navigate(PAGES.terRoute);
+
+      const territoryValue = await session.evaluate((num) => {
+        const sel = document.getElementById('TerID');
+        if (!sel) return null;
+        const re  = new RegExp(num.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
+        const opt = [...sel.options].find(o => re.test(o.text));
+        return opt ? opt.value : null;
+      }, territory_number);
+
+      if (!territoryValue) {
+        return { error: true, message: `Territory "${territory_number}" not found in the routing list. Use list_territories to confirm the exact number.` };
+      }
+
+      await session.evaluate((val) => { document.getElementById('TerID').value = val; }, territoryValue);
+      await session.evaluate(() => { document.querySelector('input[name="Route"]').click(); });
+      await session.page.waitForLoadState('domcontentloaded');
+      console.log(`[route] Opened routing page for ${territory_number}`);
+
+      // ── Step 2: Get addresses from #dragbox ───────────────────────────
+      // Also read the cleaner copypaste textarea for address text.
+      const { liItems, copypasteLines } = await session.evaluate(() => {
+        const liItems = [...document.querySelectorAll('#dragbox li')].map(li => ({
+          id:   li.id,
+          text: li.textContent.trim(),
+        }));
+        const textarea = document.getElementById('copypaste');
+        const copypasteLines = textarea
+          ? textarea.value.split('\n').map(l => l.trim()).filter(Boolean)
+          : [];
+        return { liItems, copypasteLines };
+      });
+
+      if (!liItems.length) {
+        return { error: true, message: 'No addresses found in the routing list. The territory may have no addresses.' };
+      }
+
+      console.log(`[route] ${liItems.length} addresses to sort`);
+
+      // Map li index → clean address from copypaste textarea (same order).
+      const cleanAddresses = liItems.map((li, i) => {
+        if (copypasteLines[i]) return copypasteLines[i];
+        // Fallback: strip "N: " prefix and asterisk from li text.
+        return li.text.replace(/^\d+:\s*/, '').replace(/\*$/, '').trim();
+      });
+
+      // ── Step 3: Geocode each address (server-side, 700ms between calls) ──
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const geocoded = [];
+
+      for (let i = 0; i < liItems.length; i++) {
+        const addr    = cleanAddresses[i];
+        const query   = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
+        console.log(`[route] Geocoding ${i+1}/${liItems.length}: ${addr}`);
+        const coords  = await nominatimGeocode(query);
+        const dist    = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
+        geocoded.push({ id: liItems[i].id, addr, dist, coords });
+        if (i < liItems.length - 1) await sleep(700);
+      }
+
+      // ── Step 4: Sort closest to farthest ─────────────────────────────
+      geocoded.sort((a, b) => a.dist - b.dist);
+      const sortedIds = geocoded.map(g => g.id);
+      console.log(`[route] Sorted. Closest: ${geocoded[0].addr} (${geocoded[0].dist.toFixed(1)}km) | Farthest: ${geocoded.at(-1).addr} (${geocoded.at(-1).dist.toFixed(1)}km)`);
+
+      // ── Step 5: Reorder DOM — appendChild moves li to end in sorted order
+      await session.evaluate((ids) => {
+        const parent = document.getElementById('dragbox');
+        for (const id of ids) {
+          const li = document.getElementById(id);
+          if (li) parent.appendChild(li);
+        }
+      }, sortedIds);
+
+      // ── Step 6: Click Save Route (onclick fires dosave() automatically) ──
+      await session.evaluate(() => {
+        const btn = document.querySelector('input[value="Save Route"]');
+        if (btn) btn.click();
+      });
+      await session.page.waitForLoadState('networkidle').catch(() => {});
+
+      const resultText = await session.evaluate(() => document.body.innerText);
+
+      return {
+        success:          true,
+        territory:        territory_number,
+        addresses_routed: liItems.length,
+        home_base:        '1675 Jack Calhoun Dr, Kissimmee FL 34741',
+        route: geocoded.map((g, i) => `${i+1}. ${g.addr} — ${g.dist.toFixed(1)}km`),
+        page_result:      resultText.slice(0, 300),
+      };
+    });
+  }
+
+  async function handleAddAddress({ street_number, street_name, unit, city, state = 'FL', zip, confirmed = false } = {}) {
     return withBrowser(async () => {
       const fullStreet = `${street_number} ${street_name}${unit ? ` ${unit}` : ''}`.trim();
-      console.log(`[add_address] Checking if "${fullStreet}, ${city}" already exists`);
+      console.log(`[add_address] Checking if "${fullStreet}, ${city ?? 'Central FL'}" already exists`);
+
+      // ── Step 0: Look up city/zip if not provided ───────────────────────────
+      // Address is always in Central FL — use OTM's geocoding page or search.
+      if (!city || !zip) {
+        console.log(`[add_address] Partial address — looking up city/zip for "${fullStreet}, FL"`);
+        try {
+          await session.page.goto(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(`${fullStreet}, Florida, USA`)}&format=json&limit=1&addressdetails=1`, { waitUntil: 'domcontentloaded', timeout: 10000 });
+          const geoData = await session.evaluate(() => {
+            try { return JSON.parse(document.body.innerText); } catch { return null; }
+          });
+          if (geoData?.length > 0) {
+            const addr = geoData[0].address;
+            city = city || addr.city || addr.town || addr.village || addr.hamlet || addr.county || city;
+            zip  = zip  || addr.postcode || zip;
+            console.log(`[add_address] Resolved city="${city}" zip="${zip}"`);
+          }
+        } catch (e) {
+          console.warn(`[add_address] Geocode lookup failed: ${e.message}`);
+        }
+        // Navigate back to OTM after geocoding lookup.
+        await session.navigate(PAGES.addrSearch);
+      }
 
       // ── Step 1: Search for the address in AddrSearch.php ─────────────────
       await session.navigate(PAGES.addrSearch);
 
-      // Fill search fields — try street number and name separately, or combined.
-      const fieldAttempts = [
-        ['input[name*="addr" i], input[name*="street" i], input[placeholder*="street" i], input[placeholder*="address" i]', fullStreet],
-        ['input[name*="city" i], input[placeholder*="city" i]', city],
-        ['input[name*="zip"  i], input[placeholder*="zip"  i]', zip ?? ''],
+      // Try to fill whatever search fields exist on the page.
+      const searchFields = [
+        ['input[name*="housenum" i], input[name*="streetnum" i], input[name*="addr" i]', street_number],
+        ['input[name*="streetname" i], input[name*="street" i]', street_name],
+        ['input[name*="city" i]', city ?? ''],
+        ['input[name*="zip" i]', zip ?? ''],
       ];
-      for (const [sel, val] of fieldAttempts) {
+      for (const [sel, val] of searchFields) {
         if (!val) continue;
         try { await session.fill(sel, val); } catch {}
       }
 
-      // Submit the search.
       await session.evaluate(() => {
         const btn = document.querySelector('input[type="submit"], button[type="submit"]');
         if (btn) btn.click();
       });
       await session.page.waitForLoadState('domcontentloaded');
 
-      // Check if any results came back.
-      const searchResults = await session.evaluate(() => {
-        const rows = [...document.querySelectorAll('table tbody tr')];
-        return rows.map(r => r.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean);
-      });
+      const searchResults = await session.evaluate(() =>
+        [...document.querySelectorAll('table tbody tr')]
+          .map(r => r.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean)
+      );
 
       if (searchResults.length > 0) {
-        console.log(`[add_address] Address already exists (${searchResults.length} result(s))`);
+        console.log(`[add_address] Already exists — ${searchResults.length} record(s)`);
         return {
           already_exists: true,
-          message: `This address already exists in OTM. ${searchResults.length} matching record(s) found.`,
+          message: `Address already exists in OTM (${searchResults.length} matching record(s) found). Not added.`,
           existing_records: searchResults.slice(0, 10),
         };
       }
 
-      console.log(`[add_address] Address not found — navigating to entry form`);
+      console.log(`[add_address] Not found — opening entry form`);
 
-      // ── Step 2: Navigate to the address entry form ────────────────────────
+      // ── Step 2: Navigate to entry form (AdminSingleAddr.php) ─────────────
       await session.navigate(PAGES.addrEntry);
 
-      // Fill address fields — OTM's AdminSingleAddr.php form.
-      const formFields = [
-        // Street number
-        ['input[name*="housenum" i], input[name*="house_num" i], input[name*="streetnum" i], input[name*="addr1" i], input[placeholder*="number" i]', street_number],
-        // Street name
-        ['input[name*="streetname" i], input[name*="street_name" i], input[name*="street" i], input[placeholder*="street name" i]', street_name],
-        // Unit/apt
-        ...(unit ? [['input[name*="unit" i], input[name*="apt" i], input[placeholder*="unit" i]', unit]] : []),
-        // City
-        ['input[name*="city" i], input[placeholder*="city" i]', city],
-        // State
-        ['input[name*="state" i], select[name*="state" i]', state ?? ''],
-        // Zip
-        ['input[name*="zip" i], input[placeholder*="zip" i]', zip ?? ''],
-      ];
+      // Read the form HTML so we can see the actual field names.
+      const formFields = await session.evaluate(() =>
+        [...document.querySelectorAll('input, select, textarea')]
+          .map(el => ({ tag: el.tagName, name: el.name, id: el.id, type: el.type, placeholder: el.placeholder }))
+          .filter(el => el.name)
+      );
+      console.log(`[add_address] Form fields found:`, JSON.stringify(formFields.map(f => f.name)));
 
-      for (const [sel, val] of formFields) {
-        if (!val) continue;
-        try {
-          const tag = await session.evaluate(s => document.querySelector(s)?.tagName?.toLowerCase(), sel);
-          if (tag === 'select') await session.page.selectOption(sel, { label: val }).catch(() => {});
-          else await session.fill(sel, val);
-        } catch {}
-      }
+      // ── Step 3: Fill address fields ───────────────────────────────────────
+      // Helper: fill a field by trying multiple selector candidates.
+      const fillField = async (candidates, value) => {
+        if (!value) return;
+        for (const sel of candidates) {
+          try {
+            const tag = await session.evaluate(s => document.querySelector(s)?.tagName?.toLowerCase(), sel);
+            if (!tag) continue;
+            if (tag === 'select') {
+              await session.page.selectOption(sel, { label: value }).catch(async () => {
+                // Fallback: match by value text
+                await session.evaluate((s, v) => {
+                  const el  = document.querySelector(s);
+                  if (!el) return;
+                  const opt = [...el.options].find(o => o.text.toLowerCase().includes(v.toLowerCase()));
+                  if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
+                }, sel, value);
+              });
+            } else {
+              await session.fill(sel, value);
+            }
+            return;
+          } catch {}
+        }
+      };
 
-      // Assign territory if provided.
-      if (territory) {
-        try {
-          await session.evaluate((ter) => {
-            const sel = document.querySelector('select[name*="ter" i], select[name*="territory" i]');
-            if (!sel) return;
-            const opt = [...sel.options].find(o => o.text.includes(ter) || o.value === ter);
-            if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
-          }, territory);
-        } catch {}
-      }
+      // Street number
+      await fillField(['input[name="HouseNum"]', 'input[name="housenum"]', 'input[name="StreetNum"]', 'input[name="Addr1"]', 'input[id*="house" i]', 'input[id*="num" i]'], street_number);
+      // Street name
+      await fillField(['input[name="StreetName"]', 'input[name="streetname"]', 'input[name="Street"]', 'input[id*="street" i]'], street_name);
+      // Unit/apt
+      if (unit) await fillField(['input[name="Apt"]', 'input[name="apt"]', 'input[name="Unit"]', 'input[name="unit"]', 'input[id*="apt" i]', 'input[id*="unit" i]'], unit);
+      // City
+      await fillField(['input[name="City"]', 'input[name="city"]', 'input[id*="city" i]'], city ?? '');
+      // State (always FL)
+      await fillField(['input[name="State"]', 'input[name="state"]', 'select[name="State"]', 'select[name="state"]', 'input[id*="state" i]'], state);
+      // Zip
+      await fillField(['input[name="Zip"]', 'input[name="zip"]', 'input[name="ZipCode"]', 'input[id*="zip" i]'], zip ?? '');
 
-      // Get a snapshot of the form before submitting so we can report back.
-      const formSnapshot = await session.evaluate(() => {
-        return [...document.querySelectorAll('input[type="text"], input[type="number"], select')]
-          .filter(el => el.name && el.value)
-          .map(el => `${el.name}: ${el.value}`)
-          .join(', ');
-      });
-      console.log(`[add_address] Form filled: ${formSnapshot}`);
-
-      // Submit.
+      // ── Step 4: Set language to Portuguese ────────────────────────────────
       await session.evaluate(() => {
-        const btn = document.querySelector('input[type="submit"], button[type="submit"]');
+        const langSels = ['select[name="Lang"]', 'select[name="lang"]', 'select[name="Language"]', 'select[name*="lang" i]'];
+        for (const s of langSels) {
+          const el = document.querySelector(s);
+          if (!el) continue;
+          const opt = [...el.options].find(o => /portug|por\b/i.test(o.text + o.value));
+          if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); return; }
+        }
+      });
+      console.log(`[add_address] Language set to Portuguese`);
+
+      // ── Step 5: Mark confirmed if requested ───────────────────────────────
+      if (confirmed) {
+        await session.evaluate(() => {
+          const cb = document.querySelector('input[type="checkbox"][name*="confirm" i], input[type="checkbox"][id*="confirm" i]');
+          if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
+        });
+        console.log(`[add_address] Marked as confirmed`);
+      }
+
+      // ── Step 6: Click Get Lat/Long ────────────────────────────────────────
+      console.log(`[add_address] Clicking Get Lat/Long`);
+      const latLongClicked = await session.evaluate(() => {
+        const btn = [...document.querySelectorAll('a, button, input[type="button"], input[type="submit"]')]
+          .find(el => /lat.?long|geocod|get.?coord|get.?loc/i.test(el.textContent + el.value + el.title));
+        if (btn) { btn.click(); return btn.textContent?.trim() || btn.value || true; }
+        return false;
+      });
+
+      if (latLongClicked) {
+        // Wait for lat/long fields to populate (geocoding API call).
+        await session.page.waitForFunction(() => {
+          const lat = document.querySelector('input[name="Lat"], input[name="lat"], input[id*="lat" i]');
+          return lat && lat.value && lat.value !== '0' && lat.value !== '';
+        }, { timeout: 10000 }).catch(() => {
+          console.warn(`[add_address] Lat/long did not populate within 10s — saving anyway`);
+        });
+        console.log(`[add_address] Lat/Long populated`);
+      } else {
+        console.warn(`[add_address] Get Lat/Long button not found — saving without coordinates`);
+      }
+
+      // ── Step 7: Save ──────────────────────────────────────────────────────
+      console.log(`[add_address] Saving`);
+      await session.evaluate(() => {
+        // Click Save — prefer a button explicitly labelled Save, not Get Lat/Long.
+        const btn = [...document.querySelectorAll('input[type="submit"], button[type="submit"]')]
+          .find(el => !/lat|geo|coord/i.test(el.value + el.textContent));
         if (btn) btn.click();
       });
       await session.page.waitForLoadState('networkidle').catch(() => {});
 
       const resultText = await session.evaluate(() => document.body.innerText);
-      const success    = /success|saved|added|thank/i.test(resultText);
+      const success    = /success|saved|added|record/i.test(resultText);
 
       return {
         success,
-        address: fullStreet + (city ? `, ${city}` : '') + (state ? `, ${state}` : '') + (zip ? ` ${zip}` : ''),
-        form_filled: formSnapshot,
+        address: [fullStreet, city, state, zip].filter(Boolean).join(', '),
+        confirmed,
+        language: 'Portuguese',
+        latLongClicked: !!latLongClicked,
         result: resultText.slice(0, 500),
       };
     });
@@ -1043,6 +1250,7 @@ export function createCallTool(session) {
       case 'list_announcements':          return handleListAnnouncements();
       case 'get_congregation_options':    return handleGetCongregationOptions();
       case 'get_user_preferences':        return handleGetUserPreferences();
+      case 'route_territory':             return handleRouteTerritory(args);
       case 'add_address':                 return handleAddAddress(args);
       default:
         return { error: true, message: `Unknown tool: ${name}` };

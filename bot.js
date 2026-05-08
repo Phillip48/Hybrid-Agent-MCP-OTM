@@ -199,6 +199,8 @@ ${OTM_KNOWLEDGE}
 - If the user is asking a follow-up question about data already present in this conversation (e.g. "what is the total for X and Y" after a report was already pulled), answer directly using that data WITHOUT calling any tools. Just do the math or reference the numbers already shown.
 - If checkout_territory returns already_checked_out=true, stop immediately and tell the user exactly who has the territory and since when. Do NOT attempt to check it out again.
 - When adding an address, ALWAYS use the add_address tool — it automatically checks for duplicates first and only adds if the address doesn't exist.
+- For add_address: territory and address type are always left as default (NA / Residential) — never set them. Language always defaults to Portuguese. Only set confirmed=true if the user explicitly says to mark it confirmed. If city or zip are missing, the tool will look them up (address is always in Central Florida).
+- If the user says "add 123 Main St" with no city/zip, pass what you have — the tool handles the lookup.
 
 ## Exact Workflow: Checking Out
 1. search_territories to confirm exact territory number (e.g. "OR-15A")
@@ -288,8 +290,9 @@ async function runTask(ctx, userId, task) {
   let   finalText = '';
   let   turnCount = 0;
 
-  // 75-second hard timeout — Telegram drops updates after ~90s.
-  const TIMEOUT_MS = 75_000;
+  // Routing geocodes each address at 700ms/address so it needs more time.
+  const isRoutingTask = /\broute\b/i.test(task);
+  const TIMEOUT_MS = isRoutingTask ? 240_000 : 75_000; // 4 min for routing, 75s otherwise
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(`Task timed out after ${TIMEOUT_MS / 1000}s. Try a simpler or more specific request.`)), TIMEOUT_MS)
   );
