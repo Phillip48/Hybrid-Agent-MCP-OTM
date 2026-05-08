@@ -874,14 +874,52 @@ export function createCallTool(session) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
-  // Nominatim geocoder — sequential with delay to respect rate limit.
-  async function nominatimGeocode(address) {
-    try {
-      const url  = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
-      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(8000) });
-      const data = await resp.json();
-      if (data.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
-    } catch {}
+  // Nominatim geocoder — tries multiple query forms to maximize hit rate.
+  // Uses a Central Florida viewbox to bias ambiguous results to the right area.
+  // Respects the 1-req/sec rate limit via caller-side sleep.
+  async function nominatimGeocode(rawAddress) {
+    // Central Florida bounding box (roughly Orange/Osceola/Polk counties)
+    const VIEWBOX = '-82.0,28.0,-80.7,28.9';
+
+    async function tryQuery(q) {
+      try {
+        const url  = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&viewbox=${VIEWBOX}&bounded=0&countrycodes=us`;
+        const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(10000) });
+        const data = await resp.json();
+        if (data.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
+      } catch {}
+      return null;
+    }
+
+    // Strip unit designators (APT 2, UNIT B, #4, STE 100, etc.) for a cleaner query.
+    const stripped = rawAddress.replace(/\s+(apt|unit|ste|suite|#|lot)\s*\S+/gi, '').trim();
+
+    // Ensure Florida context is present.
+    const withFL = (q) => q.toLowerCase().includes('fl') || q.toLowerCase().includes('florida') ? q : `${q}, FL`;
+
+    // Strategy 1: full address with FL hint
+    let result = await tryQuery(withFL(rawAddress));
+    if (result) return result;
+
+    // Strategy 2: stripped of unit number
+    if (stripped !== rawAddress) {
+      result = await tryQuery(withFL(stripped));
+      if (result) return result;
+    }
+
+    // Strategy 3: extract just "number street, city, FL" — drop everything after last comma pair
+    const parts = rawAddress.split(',').map(p => p.trim()).filter(Boolean);
+    if (parts.length >= 2) {
+      const simplified = `${parts[0]}, ${parts[parts.length - 1].replace(/fl\b/i, '').trim()}, FL`;
+      result = await tryQuery(simplified);
+      if (result) return result;
+    }
+
+    // Strategy 4: street address + Kissimmee FL as fallback city
+    const streetOnly = parts[0] || rawAddress;
+    result = await tryQuery(`${streetOnly}, Kissimmee, FL`);
+    if (result) return result;
+
     return null;
   }
 
@@ -943,25 +981,38 @@ export function createCallTool(session) {
         return li.text.replace(/^\d+:\s*/, '').replace(/[\s,]*\*?\s*$/, '').trim();
       });
 
-      // ── Step 5: Geocode addresses via Nominatim (sequential, 700ms gap) ──
-      const sleep   = (ms) => new Promise(r => setTimeout(r, ms));
+      // ── Step 5: Geocode all addresses via Nominatim (sequential, 1s gap) ──
+      // nominatimGeocode() tries up to 4 query strategies per address.
+      // We must finish geocoding ALL addresses before sorting or saving.
+      const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
       const geocoded = [];
-      console.log(`[route] Geocoding ${liItems.length} addresses...`);
+      const failed   = [];
+      console.log(`[route] Geocoding ${liItems.length} addresses (up to 4 strategies each)...`);
 
       for (let i = 0; i < liItems.length; i++) {
-        const addr  = cleanAddresses[i];
-        const query = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
-        const coords = await nominatimGeocode(query);
+        const addr   = cleanAddresses[i];
+        const coords = await nominatimGeocode(addr);
         const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
-        console.log(`[route] ${i + 1}/${liItems.length} ${coords ? '✓' : '✗'} ${addr}`);
+        if (coords) {
+          console.log(`[route] ${i + 1}/${liItems.length} ✓ ${addr} — ${dist.toFixed(1)}km`);
+        } else {
+          console.warn(`[route] ${i + 1}/${liItems.length} ✗ FAILED all strategies: ${addr}`);
+          failed.push(addr);
+        }
         geocoded.push({ id: liItems[i].id, addr, dist, coords });
-        if (i < liItems.length - 1) await sleep(700);
+        if (i < liItems.length - 1) await sleep(1000);
+      }
+
+      if (failed.length > 0) {
+        console.warn(`[route] WARNING: ${failed.length} address(es) could not be geocoded and will sort last:`);
+        failed.forEach(a => console.warn(`  - ${a}`));
       }
 
       // ── Step 6: Sort closest → farthest from home base ───────────────
+      // Ungeocodable addresses (dist=9999) naturally sort to the end.
       geocoded.sort((a, b) => a.dist - b.dist);
       const sortedIds = geocoded.map(g => g.id);
-      console.log(`[route] Closest: ${geocoded[0].addr} (${geocoded[0].dist.toFixed(1)}km)`);
+      console.log(`[route] Sort complete. Closest: ${geocoded[0].addr} (${geocoded[0].dist.toFixed(1)}km)`);
       console.log(`[route] Farthest: ${geocoded.at(-1).addr} (${geocoded.at(-1).dist.toFixed(1)}km)`);
 
       // ── Step 7: Disable jQuery UI Sortable then reorder #dragbox DOM ────
@@ -1021,13 +1072,16 @@ export function createCallTool(session) {
       console.log(`[route] Territory marked as routed on selection page: ${isNowRouted}`);
 
       return {
-        success:          true,
-        routed_confirmed: isNowRouted,
-        territory:        territory_number,
-        addresses_routed: liItems.length,
-        route_order_ids:  routeIds.length,
-        home_base:        '1675 Jack Calhoun Dr, Kissimmee FL 34741',
-        route:            geocoded.map((g, i) => `${i + 1}. ${g.addr} — ${g.dist.toFixed(1)}km`),
+        success:              true,
+        routed_confirmed:     isNowRouted,
+        territory:            territory_number,
+        addresses_routed:     liItems.length,
+        geocoded_count:       liItems.length - failed.length,
+        failed_geocode_count: failed.length,
+        failed_geocode_addrs: failed.length ? failed : undefined,
+        route_order_ids:      routeIds.length,
+        home_base:            '1675 Jack Calhoun Dr, Kissimmee FL 34741',
+        route:                geocoded.map((g, i) => `${i + 1}. ${g.addr} — ${g.coords ? g.dist.toFixed(1) + 'km' : 'NO GEOCODE'}`),
       };
     });
   }
