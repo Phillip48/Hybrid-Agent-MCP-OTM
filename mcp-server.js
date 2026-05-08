@@ -888,9 +888,10 @@ export function createCallTool(session) {
     return withBrowser(async () => {
       console.log(`[route] Starting route for territory ${territory_number}`);
 
-      // ── Step 1: Select territory and click Edit Route ─────────────────
+      // ── Step 1: Navigate to TerRoute.php ─────────────────────────────
       await session.navigate(PAGES.terRoute);
 
+      // Find the option value matching the territory number.
       const territoryValue = await session.evaluate((num) => {
         const sel = document.getElementById('TerID');
         if (!sel) return null;
@@ -903,19 +904,26 @@ export function createCallTool(session) {
         return { error: true, message: `Territory "${territory_number}" not found in the routing list. Use list_territories to confirm the exact number.` };
       }
 
-      await session.evaluate((val) => { document.getElementById('TerID').value = val; }, territoryValue);
-      await session.evaluate(() => { document.querySelector('input[name="Route"]').click(); });
-      await session.page.waitForLoadState('domcontentloaded');
-      console.log(`[route] Opened routing page for ${territory_number}`);
+      // ── Step 2: Select territory using Playwright's native selectOption ──
+      // <select id="TerID" name="TerID">
+      console.log(`[route] Selecting territory ${territory_number} (value: ${territoryValue})`);
+      await session.page.selectOption('#TerID', territoryValue);
 
-      // ── Step 2: Get addresses from #dragbox ───────────────────────────
-      // Also read the cleaner copypaste textarea for address text.
+      // ── Step 3: Click "Edit Route" — <input type="submit" name="Route" value="Edit Route">
+      console.log(`[route] Clicking Edit Route button`);
+      await session.page.click('input[name="Route"]');
+      await session.page.waitForLoadState('domcontentloaded');
+      console.log(`[route] Route editing page loaded`);
+
+      // ── Step 4: Read addresses from #dragbox and copypaste textarea ───
+      // Each <li id="ADDRESS_ID">N: street, city*</li>
+      // Textarea has clean addresses in the same order (better for geocoding).
       const { liItems, copypasteLines } = await session.evaluate(() => {
         const liItems = [...document.querySelectorAll('#dragbox li')].map(li => ({
           id:   li.id,
           text: li.textContent.trim(),
         }));
-        const textarea = document.getElementById('copypaste');
+        const textarea      = document.getElementById('copypaste');
         const copypasteLines = textarea
           ? textarea.value.split('\n').map(l => l.trim()).filter(Boolean)
           : [];
@@ -926,35 +934,36 @@ export function createCallTool(session) {
         return { error: true, message: 'No addresses found in the routing list. The territory may have no addresses.' };
       }
 
-      console.log(`[route] ${liItems.length} addresses to sort`);
+      console.log(`[route] ${liItems.length} addresses to geocode and sort`);
 
-      // Map li index → clean address from copypaste textarea (same order).
+      // Prefer the copypaste textarea text (cleaner); fallback to stripping "N: " from li text.
       const cleanAddresses = liItems.map((li, i) => {
         if (copypasteLines[i]) return copypasteLines[i];
-        // Fallback: strip "N: " prefix and asterisk from li text.
-        return li.text.replace(/^\d+:\s*/, '').replace(/\*$/, '').trim();
+        return li.text.replace(/^\d+:\s*/, '').replace(/[\s,]*\*?\s*$/, '').trim();
       });
 
-      // ── Step 3: Geocode each address (server-side, 700ms between calls) ──
-      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      // ── Step 5: Geocode each address server-side (700ms between requests) ──
+      const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
       const geocoded = [];
 
       for (let i = 0; i < liItems.length; i++) {
-        const addr    = cleanAddresses[i];
-        const query   = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
-        console.log(`[route] Geocoding ${i+1}/${liItems.length}: ${addr}`);
-        const coords  = await nominatimGeocode(query);
-        const dist    = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
+        const addr  = cleanAddresses[i];
+        const query = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
+        console.log(`[route] Geocoding ${i + 1}/${liItems.length}: ${addr}`);
+        const coords = await nominatimGeocode(query);
+        const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
         geocoded.push({ id: liItems[i].id, addr, dist, coords });
         if (i < liItems.length - 1) await sleep(700);
       }
 
-      // ── Step 4: Sort closest to farthest ─────────────────────────────
+      // ── Step 6: Sort closest → farthest from home base ───────────────
       geocoded.sort((a, b) => a.dist - b.dist);
       const sortedIds = geocoded.map(g => g.id);
-      console.log(`[route] Sorted. Closest: ${geocoded[0].addr} (${geocoded[0].dist.toFixed(1)}km) | Farthest: ${geocoded.at(-1).addr} (${geocoded.at(-1).dist.toFixed(1)}km)`);
+      console.log(`[route] Closest: ${geocoded[0].addr} (${geocoded[0].dist.toFixed(1)}km)`);
+      console.log(`[route] Farthest: ${geocoded.at(-1).addr} (${geocoded.at(-1).dist.toFixed(1)}km)`);
 
-      // ── Step 5: Reorder DOM — appendChild moves li to end in sorted order
+      // ── Step 7: Reorder #dragbox DOM in sorted order ──────────────────
+      // appendChild() moves each <li> to the end — result is the sorted sequence.
       await session.evaluate((ids) => {
         const parent = document.getElementById('dragbox');
         for (const id of ids) {
@@ -963,11 +972,19 @@ export function createCallTool(session) {
         }
       }, sortedIds);
 
-      // ── Step 6: Click Save Route (onclick fires dosave() automatically) ──
-      await session.evaluate(() => {
-        const btn = document.querySelector('input[value="Save Route"]');
-        if (btn) btn.click();
-      });
+      // ── Step 8: Populate RouteOrder hidden field directly ─────────────
+      // RouteOrder = comma-separated address IDs in display order.
+      // Setting it directly is more reliable than calling dosave() via evaluate.
+      // <input type="hidden" name="RouteOrder" id="RouteOrder" value="">
+      await session.evaluate((ids) => {
+        document.getElementById('RouteOrder').value = ids.join(',');
+      }, sortedIds);
+      console.log(`[route] RouteOrder set to ${sortedIds.length} IDs`);
+
+      // ── Step 9: Click "Save Route" — <input type="submit" name="Save" value="Save Route">
+      // Using Playwright's native click so the form submits properly.
+      console.log(`[route] Clicking Save Route button`);
+      await session.page.click('input[name="Save"]');
       await session.page.waitForLoadState('networkidle').catch(() => {});
 
       const resultText = await session.evaluate(() => document.body.innerText);
@@ -977,7 +994,7 @@ export function createCallTool(session) {
         territory:        territory_number,
         addresses_routed: liItems.length,
         home_base:        '1675 Jack Calhoun Dr, Kissimmee FL 34741',
-        route: geocoded.map((g, i) => `${i+1}. ${g.addr} — ${g.dist.toFixed(1)}km`),
+        route:            geocoded.map((g, i) => `${i + 1}. ${g.addr} — ${g.dist.toFixed(1)}km`),
         page_result:      resultText.slice(0, 300),
       };
     });
