@@ -1018,12 +1018,31 @@ export function createCallTool(session) {
         failed.forEach(a => console.warn(`  - ${a}`));
       }
 
-      // ── Step 6: Sort closest → farthest from home base ───────────────
-      // Ungeocodable addresses (dist=9999) naturally sort to the end.
-      geocoded.sort((a, b) => a.dist - b.dist);
-      const sortedIds = geocoded.map(g => g.id);
-      console.log(`[route] Sort complete. Closest: ${geocoded[0].addr} (${geocoded[0].dist.toFixed(1)}km)`);
-      console.log(`[route] Farthest: ${geocoded.at(-1).addr} (${geocoded.at(-1).dist.toFixed(1)}km)`);
+      // ── Step 6: Order via nearest-neighbor from home base ───────────────
+      // Produces a logical driving path instead of zigzagging by raw distance.
+      // Ungeocodable addresses (no coords) are appended at the end.
+      const withCoords    = geocoded.filter(g => g.coords);
+      const withoutCoords = geocoded.filter(g => !g.coords);
+      const ordered       = [];
+      let   current       = { lat: HOME_LAT, lon: HOME_LON };
+      const unvisited     = [...withCoords];
+
+      while (unvisited.length > 0) {
+        let nearestIdx  = 0;
+        let nearestDist = Infinity;
+        for (let i = 0; i < unvisited.length; i++) {
+          const d = haversineKm(current.lat, current.lon, unvisited[i].coords.lat, unvisited[i].coords.lon);
+          if (d < nearestDist) { nearestDist = d; nearestIdx = i; }
+        }
+        const next = unvisited.splice(nearestIdx, 1)[0];
+        ordered.push(next);
+        current = next.coords;
+      }
+
+      const sorted    = [...ordered, ...withoutCoords];
+      const sortedIds = sorted.map(g => g.id);
+      console.log(`[route] Route planned. First: ${sorted[0].addr} (${sorted[0].dist.toFixed(1)}km from home)`);
+      console.log(`[route] Last:  ${sorted.at(-1).addr} (${sorted.at(-1).dist.toFixed(1)}km from home)`);
 
       // ── Step 7: Disable jQuery UI Sortable then reorder #dragbox DOM ────
       // Disabling Sortable prevents jQuery from overriding our DOM manipulation.
@@ -1091,7 +1110,7 @@ export function createCallTool(session) {
         failed_geocode_addrs: failed.length ? failed : undefined,
         route_order_ids:      routeIds.length,
         home_base:            '1675 Jack Calhoun Dr, Kissimmee FL 34741',
-        route:                geocoded.map((g, i) => `${i + 1}. ${g.addr} — ${g.coords ? g.dist.toFixed(1) + 'km' : 'NO GEOCODE'}`),
+        route:                sorted.map((g, i) => `${i + 1}. ${g.addr} — ${g.coords ? g.dist.toFixed(1) + 'km from home' : 'NO GEOCODE'}`),
       };
     });
   }
