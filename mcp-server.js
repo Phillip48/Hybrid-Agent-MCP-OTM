@@ -874,43 +874,46 @@ export function createCallTool(session) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
-  // Nominatim geocoder — tries multiple query forms with delays between attempts.
-  // Uses a Central Florida viewbox to bias ambiguous results to the right area.
-  async function nominatimGeocode(rawAddress) {
-    const VIEWBOX  = '-82.0,28.0,-80.7,28.9';
-    const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
+  // Geocodes a US address using two fast, free services with no meaningful rate limits.
+  // Strategy 1 — US Census Geocoder: purpose-built for US addresses, very reliable, no key needed.
+  // Strategy 2 — Photon (Komoot): OSM-based, location-biased to Central FL, no key needed.
+  async function geocodeAddress(rawAddress) {
+    // Strip unit designators before querying (APT 2, UNIT B, #4, STE 100, etc.)
+    const clean = rawAddress.replace(/\s+(apt|unit|ste|suite|#|lot)\s*\S+/gi, '').trim();
+    const withFL = (q) => /\bfl\b|\bflorida\b/i.test(q) ? q : `${q}, FL`;
 
-    async function tryQuery(q) {
-      try {
-        const url  = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=json&limit=1&viewbox=${VIEWBOX}&bounded=0&countrycodes=us`;
-        const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(7000) });
-        const data = await resp.json();
-        if (data.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
-      } catch {}
-      return null;
+    // ── Strategy 1: US Census Geocoder ──────────────────────────────────────
+    try {
+      const q    = encodeURIComponent(withFL(clean));
+      const url  = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${q}&benchmark=Public_AR_Current&format=json`;
+      const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+      const data = await resp.json();
+      const match = data?.result?.addressMatches?.[0];
+      if (match) {
+        console.log(`[route]   ✓ Census hit: ${match.matchedAddress}`);
+        return { lat: match.coordinates.y, lon: match.coordinates.x };
+      }
+    } catch (e) {
+      console.warn(`[route]   Census error: ${e.message}`);
     }
 
-    // Strip unit designators (APT 2, UNIT B, #4, STE 100, etc.) for a cleaner query.
-    const stripped = rawAddress.replace(/\s+(apt|unit|ste|suite|#|lot)\s*\S+/gi, '').trim();
-    const withFL   = (q) => /\bfl\b|\bflorida\b/i.test(q) ? q : `${q}, FL`;
-    const parts    = rawAddress.split(',').map(p => p.trim()).filter(Boolean);
-
-    // Build the strategy list, skipping duplicates.
-    const queries = [];
-    queries.push(withFL(rawAddress));
-    if (stripped !== rawAddress) queries.push(withFL(stripped));
-    if (parts.length >= 2) {
-      const simplified = `${parts[0]}, ${parts[parts.length - 1].replace(/\bfl\b/i, '').trim()}, FL`;
-      if (!queries.includes(simplified)) queries.push(simplified);
+    // ── Strategy 2: Photon (Komoot) — OSM-based, biased to Central FL ───────
+    try {
+      const q    = encodeURIComponent(withFL(clean));
+      // lat/lon bias toward Kissimmee; radius keeps results in the right area
+      const url  = `https://photon.komoot.io/api/?q=${q}&limit=1&lat=28.307&lon=-81.422&lang=en`;
+      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(8000) });
+      const data = await resp.json();
+      const feat = data?.features?.[0];
+      if (feat) {
+        const [lon, lat] = feat.geometry.coordinates;
+        console.log(`[route]   ✓ Photon hit: ${feat.properties.name ?? clean}`);
+        return { lat, lon };
+      }
+    } catch (e) {
+      console.warn(`[route]   Photon error: ${e.message}`);
     }
-    const fallback = `${parts[0] || rawAddress}, Kissimmee, FL`;
-    if (!queries.includes(fallback)) queries.push(fallback);
 
-    for (let i = 0; i < queries.length; i++) {
-      if (i > 0) await sleep(1000); // respect Nominatim rate limit between fallback attempts
-      const result = await tryQuery(queries[i]);
-      if (result) return result;
-    }
     return null;
   }
 
@@ -972,28 +975,26 @@ export function createCallTool(session) {
         return li.text.replace(/^\d+:\s*/, '').replace(/[\s,]*\*?\s*$/, '').trim();
       });
 
-      // ── Step 5: Geocode all addresses via Nominatim (sequential, 1s gap) ──
-      // nominatimGeocode() tries up to 4 query strategies per address.
-      // We must finish geocoding ALL addresses before sorting or saving.
+      // ── Step 5: Geocode all addresses — Census first, Photon fallback ───────
+      // Must complete ALL geocoding before sorting or saving.
       const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
       const geocoded = [];
       const failed   = [];
-      console.log(`[route] Geocoding ${liItems.length} addresses (up to 4 strategies each)...`);
+      console.log(`[route] Geocoding ${liItems.length} addresses (Census → Photon fallback)...`);
 
       for (let i = 0; i < liItems.length; i++) {
         const addr   = cleanAddresses[i];
-        const coords = await nominatimGeocode(addr);
+        console.log(`[route] ${i + 1}/${liItems.length} geocoding: ${addr}`);
+        const coords = await geocodeAddress(addr);
         const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
         if (coords) {
           console.log(`[route] ${i + 1}/${liItems.length} ✓ ${addr} — ${dist.toFixed(1)}km`);
         } else {
-          console.warn(`[route] ${i + 1}/${liItems.length} ✗ FAILED all strategies: ${addr}`);
+          console.warn(`[route] ${i + 1}/${liItems.length} ✗ FAILED both services: ${addr}`);
           failed.push(addr);
         }
         geocoded.push({ id: liItems[i].id, addr, dist, coords });
-        // Always wait 1s after each address (nominatimGeocode already waits 1s between
-        // its internal fallback attempts, so this covers the gap for successful first-tries).
-        if (i < liItems.length - 1) await sleep(1000);
+        if (i < liItems.length - 1) await sleep(300); // small polite gap between addresses
       }
 
       if (failed.length > 0) {
