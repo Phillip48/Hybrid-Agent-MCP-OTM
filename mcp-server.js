@@ -874,10 +874,23 @@ export function createCallTool(session) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
+  // US Census Geocoder — free, no rate limit, parallel-safe, US addresses only.
+  async function censusGeocode(address) {
+    try {
+      const url  = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${encodeURIComponent(address)}&benchmark=2020&format=json`;
+      const resp = await fetch(url, { signal: AbortSignal.timeout(6000) });
+      const data = await resp.json();
+      const match = data?.result?.addressMatches?.[0];
+      if (match) return { lat: match.coordinates.y, lon: match.coordinates.x };
+    } catch {}
+    return null;
+  }
+
+  // Nominatim fallback — slower, 1 req/sec rate limit.
   async function nominatimGeocode(address) {
     try {
       const url  = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(address)}&format=json&limit=1`;
-      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0 (territory routing)' } });
+      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0 (territory routing)' }, signal: AbortSignal.timeout(8000) });
       const data = await resp.json();
       if (data.length > 0) return { lat: parseFloat(data[0].lat), lon: parseFloat(data[0].lon) };
     } catch {}
@@ -942,18 +955,37 @@ export function createCallTool(session) {
         return li.text.replace(/^\d+:\s*/, '').replace(/[\s,]*\*?\s*$/, '').trim();
       });
 
-      // ── Step 5: Geocode each address server-side (700ms between requests) ──
-      const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
-      const geocoded = [];
+      // ── Step 5: Geocode all addresses in parallel using US Census API ──────
+      // Census is free, no rate limit, and returns results in ~1-3s total.
+      // Falls back to Nominatim (sequential, 800ms delay) for any that fail.
+      console.log(`[route] Geocoding ${liItems.length} addresses via Census API (parallel)...`);
 
-      for (let i = 0; i < liItems.length; i++) {
-        const addr  = cleanAddresses[i];
-        const query = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
-        console.log(`[route] Geocoding ${i + 1}/${liItems.length}: ${addr}`);
-        const coords = await nominatimGeocode(query);
-        const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
-        geocoded.push({ id: liItems[i].id, addr, dist, coords });
-        if (i < liItems.length - 1) await sleep(700);
+      const geocoded = await Promise.all(
+        liItems.map(async (li, i) => {
+          const addr  = cleanAddresses[i];
+          const query = addr.toLowerCase().includes('fl') ? addr : `${addr}, FL`;
+          const coords = await censusGeocode(query);
+          const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
+          console.log(`[route] ${coords ? '✓' : '✗'} ${addr} — ${dist === 9999 ? 'no coords' : dist.toFixed(1) + 'km'}`);
+          return { id: li.id, addr, dist, coords };
+        })
+      );
+
+      // Fallback: retry failed addresses with Nominatim (sequential to respect rate limit).
+      const sleep   = (ms) => new Promise(r => setTimeout(r, ms));
+      const failed  = geocoded.filter(g => !g.coords);
+      if (failed.length > 0) {
+        console.log(`[route] ${failed.length} address(es) failed Census — retrying with Nominatim`);
+        for (const entry of failed) {
+          const query  = entry.addr.toLowerCase().includes('fl') ? entry.addr : `${entry.addr}, FL`;
+          const coords = await nominatimGeocode(query);
+          if (coords) {
+            entry.coords = coords;
+            entry.dist   = haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon);
+            console.log(`[route] Nominatim fallback ✓ ${entry.addr} — ${entry.dist.toFixed(1)}km`);
+          }
+          await sleep(800);
+        }
       }
 
       // ── Step 6: Sort closest → farthest from home base ───────────────

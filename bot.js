@@ -290,12 +290,30 @@ async function runTask(ctx, userId, task) {
   let   finalText = '';
   let   turnCount = 0;
 
-  // Routing geocodes each address at 700ms/address so it needs more time.
+  // Routing needs more time — Census geocoding is fast but form navigation adds overhead.
   const isRoutingTask = /\broute\b/i.test(task);
-  const TIMEOUT_MS = isRoutingTask ? 240_000 : 75_000; // 4 min for routing, 75s otherwise
+  const TIMEOUT_MS    = isRoutingTask ? 240_000 : 75_000;
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(`Task timed out after ${TIMEOUT_MS / 1000}s. Try a simpler or more specific request.`)), TIMEOUT_MS)
   );
+
+  // For routing tasks, send a progress update every 25s so Telegram doesn't go silent.
+  let routingProgressInterval = null;
+  if (isRoutingTask) {
+    let progressCount = 0;
+    const progressMessages = [
+      '⏳ Geocoding addresses...',
+      '⏳ Still geocoding — almost done...',
+      '⏳ Sorting by distance from home base...',
+      '⏳ Saving route to OTM...',
+    ];
+    routingProgressInterval = setInterval(() => {
+      const msg = progressMessages[Math.min(progressCount, progressMessages.length - 1)];
+      progressCount++;
+      log(userId, `[routing progress] ${msg}`);
+      safeEdit(ctx, statusMsg.message_id, msg).catch(() => {});
+    }, 25_000);
+  }
 
   try {
     await Promise.race([
@@ -329,6 +347,7 @@ async function runTask(ctx, userId, task) {
     ]);
 
     stopTyping();
+    if (routingProgressInterval) clearInterval(routingProgressInterval);
     log(userId, `Task complete — ${toolLog.length} tool calls, ${turnCount} AI turns`);
 
     try { await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch {}
@@ -348,6 +367,7 @@ async function runTask(ctx, userId, task) {
 
   } catch (e) {
     stopTyping();
+    if (routingProgressInterval) clearInterval(routingProgressInterval);
     err(userId, 'Task failed:', e.message);
 
     // Delete the stale "Working..." message — Telegram may reject edits on old messages.
