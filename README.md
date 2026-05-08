@@ -2,6 +2,29 @@
 
 Automates [Online Territory Manager](https://onlineterritorymanager.com) using Playwright browser automation driven by an AI agent loop. Supports **Anthropic (Claude)**, **OpenAI (GPT-4o)**, and **Groq (Llama)** as interchangeable providers, with **automatic Groq-first fallback** to keep costs low. Also exposes the same OTM actions as an MCP Server for Claude Desktop.
 
+## How it's currently used
+
+The bot runs 24/7 on a server managed by **PM2**. Congregation members interact with it entirely through **Telegram** — no app, no website, no technical knowledge required.
+
+**Typical workflow:**
+1. A user opens Telegram and messages the bot
+2. They type a plain-English request: `"Assign territory OR-15A to John Smith"`
+3. The bot opens a real Chrome browser in the background, logs into OTM, navigates the site, and completes the action
+4. Within seconds, the bot replies with a confirmation
+
+**Access is invite-only.** New users message the bot, receive their Telegram ID, and an admin runs `/allow <id>` to grant access. The user then runs `/setup` to link their OTM credentials. Everything after that is just plain conversation.
+
+**PM2** keeps the bot alive across crashes and server reboots:
+
+```bash
+pm2 start bot.js --name otm-bot   # start
+pm2 logs otm-bot                   # watch live output
+pm2 restart otm-bot                # restart after code changes
+pm2 save && pm2 startup            # survive reboots
+```
+
+Admins can also restart the bot directly from Telegram with `/restart` without needing server access.
+
 ## Architecture
 
 ```
