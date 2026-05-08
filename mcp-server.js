@@ -171,6 +171,89 @@ export const OTM_TOOLS = [
     description: 'Territory List Export — exportable list of all territories with full details.',
     inputSchema: { type: 'object', properties: {} },
   },
+  {
+    name: 'report_letter_writing',
+    description: 'Letter Writing Stats — statistics on letter writing activity across territories.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'report_address_export',
+    description: 'Address List Export with Return Visits — full address list including RV notes.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+
+  // ── Address Tools ──────────────────────────────────────────────────────────
+  {
+    name: 'search_addresses',
+    description: 'Search for addresses in the OTM database by street, city, zip, or name. Returns matching address records.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        street:  { type: 'string', description: 'Street name or number to search for.' },
+        city:    { type: 'string', description: 'City to filter by.' },
+        zip:     { type: 'string', description: 'Zip code to filter by.' },
+        name:    { type: 'string', description: 'Householder name to search for.' },
+      },
+    },
+  },
+  {
+    name: 'find_duplicate_addresses',
+    description: 'Runs the duplicate address checker to find addresses that appear more than once in the database.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+
+  // ── Territory Admin Tools ──────────────────────────────────────────────────
+  {
+    name: 'list_territory_groups',
+    description: 'Lists all territory groupings/categories configured in OTM.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'list_territory_types',
+    description: 'Lists all territory types defined in OTM (e.g. Residential, Business, Letter Writing).',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'list_campaigns',
+    description: 'Lists all campaigns configured in OTM.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+
+  // ── Admin Tools ────────────────────────────────────────────────────────────
+  {
+    name: 'list_announcements',
+    description: 'Lists current announcements posted to OTM users.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_congregation_options',
+    description: 'Returns congregation/group settings and preferences configured in OTM.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_user_preferences',
+    description: 'Returns the current user\'s OTM preferences and settings.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+
+  // ── Address entry ──────────────────────────────────────────────────────────
+  {
+    name: 'add_address',
+    description: 'Adds a new address to OTM. First checks if the address already exists in AddrSearch.php. If it does, returns the existing record. If not, navigates to AdminSingleAddr.php and fills out the form.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        street_number: { type: 'string', description: 'House/building number, e.g. "123".' },
+        street_name:   { type: 'string', description: 'Street name, e.g. "Main St".' },
+        unit:          { type: 'string', description: 'Apt/unit number (optional).' },
+        city:          { type: 'string', description: 'City name.' },
+        state:         { type: 'string', description: 'State abbreviation, e.g. "FL".' },
+        zip:           { type: 'string', description: 'Zip code.' },
+        territory:     { type: 'string', description: 'Territory number to assign the address to (optional).' },
+      },
+      required: ['street_number', 'street_name', 'city'],
+    },
+  },
 ];
 
 // ── Tool implementation factory ───────────────────────────────────────────────
@@ -187,9 +270,12 @@ export function createCallTool(session) {
   }
 
   const PAGES = {
+    // Territory checkout
     all:              '/GetStandard.php?code=A',
     available:        '/GetStandard.php?code=B',
     checkedOut:       '/MyTer.php?showallmyter=1&sort=1',
+    myFolder:         '/MyTer.php?showallmyter=0',
+    // Reports
     publishers:       '/Users.php',
     workedLog:        '/TerrWrkLog.php',
     territoryList:    '/TerrListRpt.php',
@@ -200,6 +286,20 @@ export function createCallTool(session) {
     groupStats:       '/GroupStats.php',
     statsByGrouping:  '/RptStatsByGrouping.php',
     addrDemographics: '/RptStatsAddrDemo.php',
+    letterWriting:    '/LetterWritingStats.php',
+    addressExport:    '/Backup.php?what=L',
+    // Address tools
+    addrSearch:       '/AddrSearch.php',
+    addrEntry:        '/AdminSingleAddr.php',
+    dupChecker:       '/DupChecker.php',
+    // Territory admin
+    terGroups:        '/TerGroupAdmin.php',
+    terTypes:         '/TerTypeAdmin.php',
+    campaigns:        '/CampaignAdmin.php',
+    // Admin tools
+    announcements:    '/AnnounceAdmin.php',
+    congOptions:      '/GroupPref.php',
+    userPrefs:        '/UserPref.php',
   };
 
   // ── Core helpers ────────────────────────────────────────────────────────────
@@ -343,10 +443,23 @@ export function createCallTool(session) {
       console.log('[checkout] Clicking Check Out button');
       const checkoutClicked = await clickInPanel('check out');
       if (!checkoutClicked) {
+        // Territory has no CHECK OUT button — it is already checked out.
+        // Look up who has it so we can return a useful error.
+        console.log('[checkout] No checkout button — checking who has it');
+        await session.navigate(PAGES.checkedOut);
+        const holder = await session.evaluate((num) => {
+          const re   = new RegExp(num.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
+          const rows = [...document.querySelectorAll('table tbody tr')];
+          const row  = rows.find(r => re.test(r.textContent));
+          return row ? row.innerText.replace(/\s+/g, ' ').trim() : null;
+        }, territory_number);
+
         return {
-          error: false,
-          message: 'Could not find a "Check Out" button in the panel. The territory may already be checked out.',
-          panelText: panel.text,
+          error: true,
+          already_checked_out: true,
+          message: holder
+            ? `Territory ${territory_number} is already checked out. Details: ${holder}`
+            : `Territory ${territory_number} is not available for checkout (no Check Out button found in the panel).`,
         };
       }
 
@@ -415,69 +528,87 @@ export function createCallTool(session) {
 
   async function handleReturnTerritory({ territory_number, date }) {
     return withBrowser(async () => {
-      console.log(`[return] Navigating to checked-out list`);
+      // ── Step 1: Navigate to checked-out admin view ────────────────────────
+      console.log(`[return] Navigating to checked-out admin view`);
       await session.navigate(PAGES.checkedOut);
 
-      // Find the row for this territory.
-      const rowFound = await session.evaluate((num) => {
-        const re   = new RegExp(num.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        const rows = [...document.querySelectorAll('table tbody tr')];
-        const row  = rows.find(r => re.test(r.textContent));
-        return row ? row.innerText.trim() : null;
-      }, territory_number);
-
-      if (!rowFound) {
-        return { error: false, message: `Territory "${territory_number}" is not in the checked-out list. It may already be returned.` };
+      // ── Step 2: Enable Admin Options so check-in buttons appear ──────────
+      // The check-in image button (PreCheckIn.php link) only shows when
+      // admin options are turned on. Click the toggle if it exists.
+      const adminToggled = await session.evaluate(() => {
+        const els = [...document.querySelectorAll('a, button, input[type="button"]')];
+        const toggle = els.find(el =>
+          /admin.?option|show.?admin|turn.?on.?admin/i.test(el.textContent + el.value + el.title)
+        );
+        if (toggle) { toggle.click(); return true; }
+        return false;
+      });
+      if (adminToggled) {
+        console.log(`[return] Admin options toggled — waiting for page to update`);
+        await session.page.waitForTimeout(1500);
       }
 
-      console.log(`[return] Found row: ${rowFound.slice(0, 100)}`);
-
-      // Click the return/check-in link in that row.
-      const returnClicked = await session.evaluate((num) => {
-        const re   = new RegExp(num.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        const rows = [...document.querySelectorAll('table tbody tr')];
-        const row  = rows.find(r => re.test(r.textContent));
-        if (!row) return null;
-        const link = [...row.querySelectorAll('a')].find(a =>
-          /return|check.?in|checkin|yes/i.test(a.textContent.trim())
-        );
-        if (link) { link.click(); return link.textContent.trim(); }
-        // Log all links found for debugging.
-        return { noLink: true, links: [...row.querySelectorAll('a')].map(a => a.textContent.trim()) };
+      // ── Step 3: Find the PreCheckIn.php link for this territory ──────────
+      // The link looks like: <a href="PreCheckIn.php?MyTerID=XXXX&MyTerDescr=OR-15A-...">
+      // Territory number appears in MyTerDescr URL param.
+      const checkInHref = await session.evaluate((num) => {
+        const re    = new RegExp(num.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
+        const links = [...document.querySelectorAll('a[href*="PreCheckIn.php"]')];
+        const link  = links.find(a => re.test(decodeURIComponent(a.href)));
+        return link ? link.href : null;
       }, territory_number);
 
-      if (!returnClicked || returnClicked.noLink) {
-        const allLinks = returnClicked?.links ?? [];
+      if (!checkInHref) {
+        // If no PreCheckIn link found, check whether territory is even listed.
+        const listed = await session.evaluate((num) => {
+          const re = new RegExp(num.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
+          return re.test(document.body.innerText);
+        }, territory_number);
+
         return {
           error: false,
-          message: 'Found the territory row but no return link.',
-          rowText: rowFound,
-          availableLinks: allLinks,
-          hint: 'Use click_panel_button with one of the availableLinks to return it manually.',
+          message: listed
+            ? `Found territory "${territory_number}" on the page but no check-in button. Admin options may not be enabled, or the territory is not checked out to your account.`
+            : `Territory "${territory_number}" was not found in the checked-out list. It may already be returned.`,
         };
       }
 
-      console.log(`[return] Clicked: ${returnClicked}`);
-      await session.page.waitForTimeout(2000);
+      console.log(`[return] Found check-in link: ${checkInHref}`);
 
-      // Fill date if provided.
+      // ── Step 4: Navigate to the check-in page ────────────────────────────
+      await session.page.goto(checkInHref, { waitUntil: 'domcontentloaded', timeout: 20000 });
+
+      // ── Step 5: Fill date if provided (before answering the routing question) ──
       if (date) {
-        const checkoutDate = formatDate(date);
+        const fmt = formatDate(date);
         await session.evaluate((dt) => {
           const inp = document.querySelector('input[type="date"], input[name*="date" i]');
           if (inp) { inp.value = dt; inp.dispatchEvent(new Event('change', { bubbles: true })); }
-        }, checkoutDate);
+        }, fmt);
+        console.log(`[return] Date set to ${fmt}`);
       }
 
-      // Submit any confirmation form.
-      await session.evaluate(() => {
-        const btn = document.querySelector('input[type="submit"], button[type="submit"]');
-        if (btn) btn.click();
+      // ── Step 6: Click "No" to the routing question ────────────────────────
+      // OTM asks "Do you want to route this territory?" — always click No.
+      const noClicked = await session.evaluate(() => {
+        const btn = document.querySelector('input[name="No"], input[value="No"]');
+        if (btn) { btn.click(); return true; }
+        return false;
       });
 
-      await session.page.waitForTimeout(2000);
-      const bodyText = await session.evaluate(() => document.body.innerText);
-      return { success: true, clicked: returnClicked, result: bodyText.slice(0, 500) };
+      if (!noClicked) {
+        // No routing question found — try a generic submit.
+        await session.evaluate(() => {
+          const btn = document.querySelector('input[type="submit"], button[type="submit"]');
+          if (btn) btn.click();
+        });
+      }
+
+      console.log(`[return] Routing question answered (No) — waiting for confirmation`);
+      await session.page.waitForLoadState('networkidle').catch(() => {});
+
+      const resultText = await session.evaluate(() => document.body.innerText);
+      return { success: true, result: resultText.slice(0, 1000) };
     });
   }
 
@@ -586,6 +717,264 @@ export function createCallTool(session) {
     return withBrowser(() => scrapeReportPage(PAGES.territoryExport));
   }
 
+  async function handleReportLetterWriting() {
+    return withBrowser(() => scrapeReportPage(PAGES.letterWriting));
+  }
+
+  async function handleReportAddressExport() {
+    return withBrowser(() => scrapeReportPage(PAGES.addressExport));
+  }
+
+  // ── Address tool handlers ───────────────────────────────────────────────────
+
+  async function handleSearchAddresses({ street, city, zip, name } = {}) {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.addrSearch);
+
+      // Fill whichever search fields were provided.
+      const fieldMap = [
+        ['input[name*="street" i], input[placeholder*="street" i]', street],
+        ['input[name*="city"   i], input[placeholder*="city"   i]', city],
+        ['input[name*="zip"    i], input[placeholder*="zip"    i]', zip],
+        ['input[name*="name"   i], input[placeholder*="name"   i]', name],
+      ];
+      for (const [sel, val] of fieldMap) {
+        if (!val) continue;
+        try { await session.fill(sel, val); } catch {}
+      }
+
+      // Submit the search form.
+      try {
+        await session.evaluate(() => {
+          const btn = document.querySelector('input[type="submit"], button[type="submit"]');
+          if (btn) btn.click();
+        });
+        await session.page.waitForLoadState('domcontentloaded');
+      } catch {}
+
+      const table = await session.scrapeTable('table');
+      const text  = await session.evaluate(() => document.body.innerText);
+      return table?.rows?.length
+        ? { headers: table.headers, addresses: table.rows, count: table.rows.length }
+        : { raw: text.slice(0, 4000) };
+    });
+  }
+
+  async function handleFindDuplicateAddresses() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.dupChecker);
+      // The duplicate checker may need a button click to run the check.
+      try {
+        await session.evaluate(() => {
+          const btn = document.querySelector('input[type="submit"], button[type="submit"], button:not([type])');
+          if (btn) btn.click();
+        });
+        await session.page.waitForLoadState('networkidle').catch(() => {});
+      } catch {}
+      const table = await session.scrapeTable('table');
+      const text  = await session.evaluate(() => document.body.innerText);
+      return table?.rows?.length
+        ? { headers: table.headers, duplicates: table.rows, count: table.rows.length }
+        : { raw: text.slice(0, 5000) };
+    });
+  }
+
+  // ── Territory admin handlers ────────────────────────────────────────────────
+
+  async function handleListTerritoryGroups() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.terGroups);
+      const table = await session.scrapeTable('table');
+      const text  = await session.evaluate(() => document.body.innerText);
+      return table?.rows?.length
+        ? { headers: table.headers, groups: table.rows, count: table.rows.length }
+        : { raw: text.slice(0, 4000) };
+    });
+  }
+
+  async function handleListTerritoryTypes() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.terTypes);
+      const table = await session.scrapeTable('table');
+      const text  = await session.evaluate(() => document.body.innerText);
+      return table?.rows?.length
+        ? { headers: table.headers, types: table.rows, count: table.rows.length }
+        : { raw: text.slice(0, 4000) };
+    });
+  }
+
+  async function handleListCampaigns() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.campaigns);
+      const table = await session.scrapeTable('table');
+      const text  = await session.evaluate(() => document.body.innerText);
+      return table?.rows?.length
+        ? { headers: table.headers, campaigns: table.rows, count: table.rows.length }
+        : { raw: text.slice(0, 4000) };
+    });
+  }
+
+  // ── Admin tool handlers ─────────────────────────────────────────────────────
+
+  async function handleListAnnouncements() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.announcements);
+      const table = await session.scrapeTable('table');
+      const text  = await session.evaluate(() => document.body.innerText);
+      return table?.rows?.length
+        ? { headers: table.headers, announcements: table.rows, count: table.rows.length }
+        : { raw: text.slice(0, 4000) };
+    });
+  }
+
+  async function handleGetCongregationOptions() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.congOptions);
+      const text = await session.evaluate(() => document.body.innerText);
+      // Also grab all form input values as key-value pairs.
+      const settings = await session.evaluate(() => {
+        return [...document.querySelectorAll('input, select, textarea')]
+          .filter(el => el.name && el.type !== 'submit' && el.type !== 'button')
+          .map(el => ({
+            name:  el.name,
+            type:  el.type || el.tagName.toLowerCase(),
+            value: el.type === 'checkbox' ? el.checked : el.value,
+            label: el.closest('tr, div, p')?.querySelector('label, th, td')?.textContent?.trim() || el.name,
+          }));
+      });
+      return { settings, text: text.slice(0, 4000) };
+    });
+  }
+
+  async function handleAddAddress({ street_number, street_name, unit, city, state, zip, territory } = {}) {
+    return withBrowser(async () => {
+      const fullStreet = `${street_number} ${street_name}${unit ? ` ${unit}` : ''}`.trim();
+      console.log(`[add_address] Checking if "${fullStreet}, ${city}" already exists`);
+
+      // ── Step 1: Search for the address in AddrSearch.php ─────────────────
+      await session.navigate(PAGES.addrSearch);
+
+      // Fill search fields — try street number and name separately, or combined.
+      const fieldAttempts = [
+        ['input[name*="addr" i], input[name*="street" i], input[placeholder*="street" i], input[placeholder*="address" i]', fullStreet],
+        ['input[name*="city" i], input[placeholder*="city" i]', city],
+        ['input[name*="zip"  i], input[placeholder*="zip"  i]', zip ?? ''],
+      ];
+      for (const [sel, val] of fieldAttempts) {
+        if (!val) continue;
+        try { await session.fill(sel, val); } catch {}
+      }
+
+      // Submit the search.
+      await session.evaluate(() => {
+        const btn = document.querySelector('input[type="submit"], button[type="submit"]');
+        if (btn) btn.click();
+      });
+      await session.page.waitForLoadState('domcontentloaded');
+
+      // Check if any results came back.
+      const searchResults = await session.evaluate(() => {
+        const rows = [...document.querySelectorAll('table tbody tr')];
+        return rows.map(r => r.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean);
+      });
+
+      if (searchResults.length > 0) {
+        console.log(`[add_address] Address already exists (${searchResults.length} result(s))`);
+        return {
+          already_exists: true,
+          message: `This address already exists in OTM. ${searchResults.length} matching record(s) found.`,
+          existing_records: searchResults.slice(0, 10),
+        };
+      }
+
+      console.log(`[add_address] Address not found — navigating to entry form`);
+
+      // ── Step 2: Navigate to the address entry form ────────────────────────
+      await session.navigate(PAGES.addrEntry);
+
+      // Fill address fields — OTM's AdminSingleAddr.php form.
+      const formFields = [
+        // Street number
+        ['input[name*="housenum" i], input[name*="house_num" i], input[name*="streetnum" i], input[name*="addr1" i], input[placeholder*="number" i]', street_number],
+        // Street name
+        ['input[name*="streetname" i], input[name*="street_name" i], input[name*="street" i], input[placeholder*="street name" i]', street_name],
+        // Unit/apt
+        ...(unit ? [['input[name*="unit" i], input[name*="apt" i], input[placeholder*="unit" i]', unit]] : []),
+        // City
+        ['input[name*="city" i], input[placeholder*="city" i]', city],
+        // State
+        ['input[name*="state" i], select[name*="state" i]', state ?? ''],
+        // Zip
+        ['input[name*="zip" i], input[placeholder*="zip" i]', zip ?? ''],
+      ];
+
+      for (const [sel, val] of formFields) {
+        if (!val) continue;
+        try {
+          const tag = await session.evaluate(s => document.querySelector(s)?.tagName?.toLowerCase(), sel);
+          if (tag === 'select') await session.page.selectOption(sel, { label: val }).catch(() => {});
+          else await session.fill(sel, val);
+        } catch {}
+      }
+
+      // Assign territory if provided.
+      if (territory) {
+        try {
+          await session.evaluate((ter) => {
+            const sel = document.querySelector('select[name*="ter" i], select[name*="territory" i]');
+            if (!sel) return;
+            const opt = [...sel.options].find(o => o.text.includes(ter) || o.value === ter);
+            if (opt) { sel.value = opt.value; sel.dispatchEvent(new Event('change', { bubbles: true })); }
+          }, territory);
+        } catch {}
+      }
+
+      // Get a snapshot of the form before submitting so we can report back.
+      const formSnapshot = await session.evaluate(() => {
+        return [...document.querySelectorAll('input[type="text"], input[type="number"], select')]
+          .filter(el => el.name && el.value)
+          .map(el => `${el.name}: ${el.value}`)
+          .join(', ');
+      });
+      console.log(`[add_address] Form filled: ${formSnapshot}`);
+
+      // Submit.
+      await session.evaluate(() => {
+        const btn = document.querySelector('input[type="submit"], button[type="submit"]');
+        if (btn) btn.click();
+      });
+      await session.page.waitForLoadState('networkidle').catch(() => {});
+
+      const resultText = await session.evaluate(() => document.body.innerText);
+      const success    = /success|saved|added|thank/i.test(resultText);
+
+      return {
+        success,
+        address: fullStreet + (city ? `, ${city}` : '') + (state ? `, ${state}` : '') + (zip ? ` ${zip}` : ''),
+        form_filled: formSnapshot,
+        result: resultText.slice(0, 500),
+      };
+    });
+  }
+
+  async function handleGetUserPreferences() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.userPrefs);
+      const text = await session.evaluate(() => document.body.innerText);
+      const settings = await session.evaluate(() => {
+        return [...document.querySelectorAll('input, select, textarea')]
+          .filter(el => el.name && el.type !== 'submit' && el.type !== 'button')
+          .map(el => ({
+            name:  el.name,
+            type:  el.type || el.tagName.toLowerCase(),
+            value: el.type === 'checkbox' ? el.checked : el.value,
+            label: el.closest('tr, div, p')?.querySelector('label, th, td')?.textContent?.trim() || el.name,
+          }));
+      });
+      return { settings, text: text.slice(0, 4000) };
+    });
+  }
+
   // ── Generic tools ───────────────────────────────────────────────────────────
 
   async function handleClickPanelButton({ button_text }) {
@@ -634,13 +1023,27 @@ export function createCallTool(session) {
       case 'get_page_content':         return handleGetPageContent();
       case 'navigate_page':            return handleNavigatePage(args);
       case 'take_screenshot':          return handleTakeScreenshot();
-      case 'report_worked_log':        return handleReportWorkedLog();
-      case 'report_territory_list':    return handleReportTerritoryList();
-      case 'report_checkinout':        return handleReportCheckinOut(args);
-      case 'report_group_stats':       return handleReportGroupStats();
-      case 'report_stats_by_grouping': return handleReportStatsByGrouping();
+      case 'report_worked_log':           return handleReportWorkedLog();
+      case 'report_territory_list':       return handleReportTerritoryList();
+      case 'report_checkinout':           return handleReportCheckinOut(args);
+      case 'report_group_stats':          return handleReportGroupStats();
+      case 'report_stats_by_grouping':    return handleReportStatsByGrouping();
       case 'report_address_demographics': return handleReportAddressDemographics();
-      case 'report_territory_export':  return handleReportTerritoryExport();
+      case 'report_territory_export':     return handleReportTerritoryExport();
+      case 'report_letter_writing':       return handleReportLetterWriting();
+      case 'report_address_export':       return handleReportAddressExport();
+      // Address tools
+      case 'search_addresses':            return handleSearchAddresses(args);
+      case 'find_duplicate_addresses':    return handleFindDuplicateAddresses();
+      // Territory admin
+      case 'list_territory_groups':       return handleListTerritoryGroups();
+      case 'list_territory_types':        return handleListTerritoryTypes();
+      case 'list_campaigns':              return handleListCampaigns();
+      // Admin tools
+      case 'list_announcements':          return handleListAnnouncements();
+      case 'get_congregation_options':    return handleGetCongregationOptions();
+      case 'get_user_preferences':        return handleGetUserPreferences();
+      case 'add_address':                 return handleAddAddress(args);
       default:
         return { error: true, message: `Unknown tool: ${name}` };
     }

@@ -10,7 +10,7 @@ export const DEFAULT_MODELS = {
   groq: 'llama-3.3-70b-versatile',
 };
 
-const MAX_TURNS = 20;
+const MAX_TURNS = 12; // If not done in 12 turns something is wrong.
 
 // ── Tool format converters ────────────────────────────────────────────────────
 
@@ -39,9 +39,20 @@ function truncate(text, max = 8000) {
   return text.length > max ? text.slice(0, max) + '\n... [truncated]' : text;
 }
 
-async function executeToolCalls(toolCalls, callTool, onToolCall, onToolResult) {
+async function executeToolCalls(toolCalls, callTool, onToolCall, onToolResult, recentTools) {
   return Promise.all(
     toolCalls.map(async ({ id, name, input }) => {
+      // Loop detection: if the same tool has been called 3 times in the last 5 calls, abort.
+      recentTools.push(name);
+      if (recentTools.length > 5) recentTools.shift();
+      const repeatCount = recentTools.filter(t => t === name).length;
+      if (repeatCount >= 3) {
+        const msg = `Loop detected: "${name}" called ${repeatCount} times in the last ${recentTools.length} turns. Stopping to avoid infinite loop.`;
+        onToolCall?.(name, input);
+        onToolResult?.(name, msg);
+        return { id, name, resultText: JSON.stringify({ error: true, message: msg }) };
+      }
+
       onToolCall?.(name, input);
       const result = await callTool(name, input);
       const resultText = truncate(JSON.stringify(result, null, 2));
@@ -51,10 +62,11 @@ async function executeToolCalls(toolCalls, callTool, onToolCall, onToolResult) {
   );
 }
 
-async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult }) {
+async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
   const client = new Anthropic();
   const formattedTools = toAnthropicTools(tools);
-  const messages = [{ role: 'user', content: task }];
+  const messages = [...priorMessages, { role: 'user', content: task }];
+  const recentTools = [];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     const response = await client.messages.create({
@@ -76,7 +88,7 @@ async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onTex
     if (response.stop_reason === 'end_turn' || toolUseBlocks.length === 0) break;
 
     const pending = toolUseBlocks.map((b) => ({ id: b.id, name: b.name, input: b.input }));
-    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult);
+    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
 
     messages.push({
       role: 'user',
@@ -91,13 +103,15 @@ async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onTex
   }
 }
 
-async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult }) {
+async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
   const client = new OpenAI();
   const formattedTools = toOpenAITools(tools);
   const messages = [
     { role: 'system', content: systemPrompt },
+    ...priorMessages,
     { role: 'user', content: task },
   ];
+  const recentTools = [];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     const response = await client.chat.completions.create({
@@ -112,7 +126,6 @@ async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, 
 
     if (msg.content) onText?.(msg.content);
 
-    // Push the assistant message (with any tool_calls) into history.
     messages.push(msg);
 
     const toolCalls = msg.tool_calls ?? [];
@@ -125,7 +138,7 @@ async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, 
       input: JSON.parse(tc.function.arguments || '{}'),
     }));
 
-    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult);
+    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
 
     for (const { id, name, resultText } of results) {
       messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
@@ -135,13 +148,15 @@ async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, 
   }
 }
 
-async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult }) {
+async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
   const client = new Groq();
   const formattedTools = toOpenAITools(tools);
   const messages = [
     { role: 'system', content: systemPrompt },
+    ...priorMessages,
     { role: 'user', content: task },
   ];
+  const recentTools = [];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
     const response = await client.chat.completions.create({
@@ -168,7 +183,7 @@ async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, on
       input: JSON.parse(tc.function.arguments || '{}'),
     }));
 
-    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult);
+    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
 
     for (const { id, name, resultText } of results) {
       messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });

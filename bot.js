@@ -28,6 +28,36 @@ const bot = new Telegraf(TOKEN);
 const setupState  = new Map(); // userId -> { step, data }
 const activeTasks = new Set(); // userIds with a running task
 
+// Conversation history: userId -> { messages: [{role,content},...], lastActivity: ms }
+// Kept for 30 minutes of inactivity, capped at last 6 messages (3 exchanges).
+const chatHistory = new Map();
+
+function getHistory(userId) {
+  const h = chatHistory.get(userId);
+  if (!h) return [];
+  if (Date.now() - h.lastActivity > 30 * 60 * 1000) {
+    chatHistory.delete(userId);
+    return [];
+  }
+  return h.messages;
+}
+
+function appendHistory(userId, userMsg, assistantMsg) {
+  const h = chatHistory.get(userId) ?? { messages: [], lastActivity: 0 };
+  h.messages.push(
+    { role: 'user',      content: userMsg },
+    { role: 'assistant', content: assistantMsg },
+  );
+  // Keep last 6 messages (3 exchanges) so context doesn't grow unbounded.
+  if (h.messages.length > 6) h.messages = h.messages.slice(-6);
+  h.lastActivity = Date.now();
+  chatHistory.set(userId, h);
+}
+
+function clearHistory(userId) {
+  chatHistory.delete(userId);
+}
+
 // ── Logging helpers ───────────────────────────────────────────────────────────
 
 function log(userId, ...args)  { console.log( `[bot:${userId}]`, ...args); }
@@ -58,6 +88,7 @@ async function startSetup(ctx) {
   const userId = String(ctx.from.id);
   log(userId, 'Starting setup wizard');
   setupState.set(userId, { step: 'email', data: {} });
+  clearHistory(userId); // fresh credentials = fresh conversation
   await ctx.reply('🔧 *OTM Setup*\n\nWhat is your OTM username?', { parse_mode: 'Markdown' });
 }
 
@@ -152,9 +183,11 @@ ${OTM_KNOWLEDGE}
 5. The checkout_territory tool handles ALL of these steps automatically. Just provide the territory number and publisher name.
 
 ## Return Flow (exactly how OTM works)
-1. MyTer.php?showallmyter=1 shows all checked-out territories in a table.
-2. Each row has a link (labelled "Yes" or "Return") to return/check-in the territory.
-3. The return_territory tool handles this automatically.
+1. Navigate to MyTer.php?showallmyter=1&sort=1 (Checked Out Admin view).
+2. Enable Admin Options on the page (toggle/button) — this makes the check-in button appear.
+3. The check-in button is an IMAGE link (no visible text) pointing to PreCheckIn.php?MyTerID=XXXX&MyTerDescr=TERRITORY_NUMBER-...
+4. After clicking check-in, OTM asks about routing — always click the "No" button (input[name="No"]).
+5. The return_territory tool handles all of these steps automatically.
 
 ## Tool Usage Rules
 - NEVER guess territory numbers. Use search_territories or list_territories first if unsure.
@@ -162,6 +195,10 @@ ${OTM_KNOWLEDGE}
 - If checkout_territory returns availableOptions, the publisher name didn't match. Pick the closest name from availableOptions and retry.
 - If checkout_territory says "already checked out", use get_territory_status to confirm, then report to the user.
 - For return: use return_territory. If it returns availableLinks, use one of those link texts with click_panel_button.
+- NEVER call the same tool more than twice in a row. If a tool returns the same result twice, stop and tell the user what happened.
+- If the user is asking a follow-up question about data already present in this conversation (e.g. "what is the total for X and Y" after a report was already pulled), answer directly using that data WITHOUT calling any tools. Just do the math or reference the numbers already shown.
+- If checkout_territory returns already_checked_out=true, stop immediately and tell the user exactly who has the territory and since when. Do NOT attempt to check it out again.
+- When adding an address, ALWAYS use the add_address tool — it automatically checks for duplicates first and only adds if the address doesn't exist.
 
 ## Exact Workflow: Checking Out
 1. search_territories to confirm exact territory number (e.g. "OR-15A")
@@ -229,6 +266,9 @@ async function runTask(ctx, userId, task) {
 
   log(userId, `Task received: "${task}"`);
 
+  const history  = getHistory(userId);
+  if (history.length > 0) log(userId, `Resuming conversation — ${history.length / 2} prior exchange(s) in context`);
+
   const user     = await getUser(userId);
   const PROVIDER = user.provider || process.env.AI_PROVIDER || 'anthropic';
   const MODEL    = user.model    || DEFAULT_MODELS[PROVIDER];
@@ -248,32 +288,42 @@ async function runTask(ctx, userId, task) {
   let   finalText = '';
   let   turnCount = 0;
 
+  // 75-second hard timeout — Telegram drops updates after ~90s.
+  const TIMEOUT_MS = 75_000;
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(`Task timed out after ${TIMEOUT_MS / 1000}s. Try a simpler or more specific request.`)), TIMEOUT_MS)
+  );
+
   try {
-    await runAgentLoop({
-      task,
-      provider: PROVIDER,
-      model: MODEL,
-      systemPrompt: SYSTEM_PROMPT,
-      tools: OTM_TOOLS,
-      callTool,
-      onText: (text) => {
-        finalText = text;
-        turnCount++;
-        log(userId, `[turn ${turnCount}] Model response (${text.length} chars)`);
-      },
-      onToolCall: (name, input) => {
-        const inputStr = JSON.stringify(input);
-        log(userId, `[tool →] ${name} ${inputStr}`);
-        toolLog.push(`→ ${name}`);
-        if (toolLog.length <= 10) {
-          safeEdit(ctx, statusMsg.message_id, `⏳ Working...\n\`\`\`\n${toolLog.join('\n')}\n\`\`\``).catch(() => {});
-        }
-      },
-      onToolResult: (name, result) => {
-        const preview = result.slice(0, 200).replace(/\n/g, ' ');
-        log(userId, `[tool ←] ${name}: ${preview}${result.length > 200 ? '…' : ''}`);
-      },
-    });
+    await Promise.race([
+      runAgentLoop({
+        task,
+        provider: PROVIDER,
+        model: MODEL,
+        systemPrompt: SYSTEM_PROMPT,
+        tools: OTM_TOOLS,
+        callTool,
+        priorMessages: history,
+        onText: (text) => {
+          finalText = text;
+          turnCount++;
+          log(userId, `[turn ${turnCount}] Model response (${text.length} chars)`);
+        },
+        onToolCall: (name, input) => {
+          const inputStr = JSON.stringify(input);
+          log(userId, `[tool →] ${name} ${inputStr}`);
+          toolLog.push(`→ ${name}`);
+          if (toolLog.length <= 10) {
+            safeEdit(ctx, statusMsg.message_id, `⏳ Working...\n\`\`\`\n${toolLog.join('\n')}\n\`\`\``).catch(() => {});
+          }
+        },
+        onToolResult: (name, result) => {
+          const preview = result.slice(0, 200).replace(/\n/g, ' ');
+          log(userId, `[tool ←] ${name}: ${preview}${result.length > 200 ? '…' : ''}`);
+        },
+      }),
+      timeoutPromise,
+    ]);
 
     stopTyping();
     log(userId, `Task complete — ${toolLog.length} tool calls, ${turnCount} AI turns`);
@@ -286,13 +336,30 @@ async function runTask(ctx, userId, task) {
       await ctx.reply(summary, { parse_mode: 'Markdown' }).catch(() => ctx.reply(toolLog.join('\n')));
     }
 
+    const responseText = finalText || '✅ Task complete.';
     // Always send AI response as plain text to avoid Markdown parse errors.
-    await ctx.reply(finalText || '✅ Task complete.');
+    await ctx.reply(responseText);
+
+    // Save to conversation history so follow-up questions have context.
+    appendHistory(userId, task, responseText);
 
   } catch (e) {
     stopTyping();
     err(userId, 'Task failed:', e.message);
-    await safeEdit(ctx, statusMsg.message_id, `❌ Error: ${e.message}`);
+
+    // Delete the stale "Working..." message — Telegram may reject edits on old messages.
+    try { await ctx.telegram.deleteMessage(ctx.chat.id, statusMsg.message_id); } catch {}
+
+    const isTimeout = e.message.includes('timed out');
+    const errorMsg  = isTimeout
+      ? `⏱ Task timed out (75s limit reached).\n\nThe browser was still working but ran out of time. Try again with a more specific request, e.g:\n• "Return territory OR-15A"\n• "Checkout territory OR-15A to John Smith"\n\nIf it keeps timing out, send /debug to check the session.`
+      : `❌ ${e.message}`;
+
+    // Send as a fresh reply — more reliable than editing after a long delay.
+    await ctx.reply(errorMsg).catch((replyErr) => {
+      err(userId, 'Failed to send error reply:', replyErr.message);
+    });
+
   } finally {
     activeTasks.delete(userId);
   }
