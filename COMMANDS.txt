@@ -1,0 +1,133 @@
+================================================================================
+  OTM BOT — COMMAND REFERENCE
+================================================================================
+
+--------------------------------------------------------------------------------
+TELEGRAM BOT COMMANDS
+--------------------------------------------------------------------------------
+
+USER COMMANDS
+  /start              Welcome message. Starts setup if not registered.
+  /setup              Connect or update your OTM credentials (email + password).
+  /status             Show your current OTM account and connection status.
+  /debug              Test your OTM session right now. Shows the page it lands on.
+  /myid               Show your Telegram user ID.
+  /cancel             Cancel an active setup wizard.
+  /setprovider        Show current AI provider and available options.
+  /setprovider openai          Switch to OpenAI (GPT-4o).
+  /setprovider anthropic       Switch to Anthropic (Claude).
+  /setprovider groq            Switch to Groq (Llama).
+  /setprovider openai gpt-4o-mini   Switch provider AND override the model.
+
+ADMIN COMMANDS (your Telegram ID only)
+  /allow <id>         Allow a user to register with the bot.
+  /deny <id>          Remove a user's access.
+  /users              List all registered users and their status.
+
+--------------------------------------------------------------------------------
+EXAMPLE OTM TASKS (send as plain messages)
+--------------------------------------------------------------------------------
+
+TERRITORIES
+  Show me all available territories
+  List all territories not worked in over a year
+  List territories in group 3
+  Search for Lake Nona territories
+  What is the status of territory OR-15A?
+  Who currently has territory OR-15A?
+  Show me all checked-out territories
+  Assign territory OR-15A to Phillip Pereira
+  Return territory OR-15A
+
+REPORTS
+  Pull a report of total confirmed addresses
+  Run the address demographics report
+  Show me the territory worked log
+  Pull the S-13 check in/out report
+  Show group statistics
+  Show stats by territory grouping
+  Run the territory list report
+  Export the territory list
+  Show letter writing stats
+  Export address list with return visits
+
+PUBLISHERS
+  List all publishers
+  Show me publishers in group 2
+  Find publisher John Smith
+
+ADDRESS TOOLS
+  Search for addresses on Main Street
+  Search for addresses in Kissimmee
+  Find duplicate addresses
+
+TERRITORY ADMIN
+  List all territory groups
+  List territory types
+  List campaigns
+
+ADMIN / SETTINGS
+  Show announcements
+  Show congregation options
+  Show my user preferences
+
+--------------------------------------------------------------------------------
+CLI COMMANDS (run in the project folder on your PC)
+--------------------------------------------------------------------------------
+
+START / STOP
+  node bot.js                        Start the bot (foreground)
+  node index.js "your task"          Run a task directly without Telegram
+  npm run bot                        Same as node bot.js
+  npm run debug                      Run with visible browser (HEADLESS=false)
+
+PM2 (KEEP BOT RUNNING)
+  pm2 start bot.js --name otm-bot   Start bot with pm2
+  pm2 stop otm-bot                   Stop the bot
+  pm2 restart otm-bot                Restart the bot
+  pm2 logs otm-bot                   Watch live console output
+  pm2 list                           See all running processes
+  pm2 save                           Save current process list (survives reboot)
+
+PROVIDERS (CLI)
+  node index.js "task"                          Use default provider
+  node index.js --provider openai "task"        Use OpenAI
+  node index.js --provider anthropic "task"     Use Anthropic
+  node index.js --provider groq "task"          Use Groq
+  node index.js -p openai -m gpt-4o-mini "task" Provider + model override
+
+UTILITIES
+  node --check bot.js                Syntax check bot.js
+  node -e "import('crypto').then(m => console.log(m.randomBytes(32).toString('hex')))"
+                                     Generate a new STORE_KEY
+
+MCP SERVER (for Claude Desktop)
+  node mcp-server.js                 Start the standalone MCP server
+
+--------------------------------------------------------------------------------
+.ENV VARIABLES
+--------------------------------------------------------------------------------
+
+  OTM_USER              Your OTM login username
+  OTM_PASS              Your OTM login password
+  HEADLESS              true (invisible) | false (visible browser for debugging)
+  AI_PROVIDER           Default provider: anthropic | openai | groq
+  ANTHROPIC_API_KEY     API key from console.anthropic.com
+  OPENAI_API_KEY        API key from platform.openai.com
+  GROQ_API_KEY          API key from console.groq.com
+  TELEGRAM_BOT_TOKEN    Token from @BotFather on Telegram
+  TELEGRAM_ADMIN_IDS    Your Telegram user ID (comma-separated for multiple)
+  STORE_KEY             64-char hex key for encrypting stored credentials
+
+--------------------------------------------------------------------------------
+TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+  Session expired / login page shown   → Send /debug to test the session
+  Bot not responding                   → Run: pm2 logs otm-bot
+  Wrong publisher selected             → Use full name as it appears in OTM
+  Territory not found                  → Use list_territories to find exact number
+  Task times out after 75s            → Break the task into smaller steps
+  Want to reset everything             → Delete cookies/ and data/ folders, restart
+
+================================================================================
