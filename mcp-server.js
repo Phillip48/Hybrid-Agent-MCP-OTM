@@ -972,30 +972,61 @@ export function createCallTool(session) {
         }
       }, sortedIds);
 
-      // ── Step 8: Populate RouteOrder hidden field directly ─────────────
-      // RouteOrder = comma-separated address IDs in display order.
-      // Setting it directly is more reliable than calling dosave() via evaluate.
-      // <input type="hidden" name="RouteOrder" id="RouteOrder" value="">
-      await session.evaluate((ids) => {
-        document.getElementById('RouteOrder').value = ids.join(',');
-      }, sortedIds);
-      console.log(`[route] RouteOrder set to ${sortedIds.length} IDs`);
+      // ── Step 8: Call dosave() explicitly then verify RouteOrder ─────────
+      // dosave() reads the current DOM order of #dragbox LI children and writes
+      // their IDs as a comma-separated list into the RouteOrder hidden field.
+      await session.evaluate(() => { dosave(); });
 
-      // ── Step 9: Click "Save Route" — <input type="submit" name="Save" value="Save Route">
-      // Using Playwright's native click so the form submits properly.
-      console.log(`[route] Clicking Save Route button`);
-      await session.page.click('input[name="Save"]');
+      const routeOrder = await session.evaluate(() =>
+        document.getElementById('RouteOrder').value
+      );
+      const routeIds = routeOrder.split(',').filter(Boolean);
+      console.log(`[route] RouteOrder populated — ${routeIds.length} IDs: ${routeOrder.slice(0, 80)}…`);
+
+      if (!routeOrder) {
+        return { error: true, message: 'RouteOrder field is empty after dosave() — DOM reorder may have failed.' };
+      }
+
+      // ── Step 9: Submit the form programmatically with Save action ────────
+      // form.submit() does NOT include the clicked button's name/value, so we
+      // inject a hidden input named "Save" so OTM's PHP knows it's a save request
+      // (not Cancel or Back). This is more reliable than Playwright clicking the
+      // submit button because onclick timing can interfere with form.submit().
+      console.log(`[route] Submitting form with Save action`);
+      await session.evaluate(() => {
+        const form = document.getElementById('mainform2');
+        // Inject Save button value so PHP receives $_POST['Save'] = 'Save Route'.
+        const hidden  = document.createElement('input');
+        hidden.type   = 'hidden';
+        hidden.name   = 'Save';
+        hidden.value  = 'Save Route';
+        form.appendChild(hidden);
+        form.submit();
+      });
       await session.page.waitForLoadState('networkidle').catch(() => {});
 
       const resultText = await session.evaluate(() => document.body.innerText);
+      console.log(`[route] Post-save page: ${resultText.slice(0, 150)}`);
+
+      // ── Step 10: Verify the territory is now marked as routed ────────────
+      // Navigate back to the selection page and check if the territory option
+      // is now shaded (background-color:#80FFFF = routed in OTM).
+      await session.navigate(PAGES.terRoute);
+      const isNowRouted = await session.evaluate((val) => {
+        const opt = document.querySelector(`#TerID option[value="${val}"]`);
+        return opt ? opt.style.backgroundColor.includes('80FFFF') || opt.style.backgroundColor.includes('rgb') : null;
+      }, territoryValue);
+
+      console.log(`[route] Territory marked as routed on selection page: ${isNowRouted}`);
 
       return {
         success:          true,
+        routed_confirmed: isNowRouted,
         territory:        territory_number,
         addresses_routed: liItems.length,
+        route_order_ids:  routeIds.length,
         home_base:        '1675 Jack Calhoun Dr, Kissimmee FL 34741',
         route:            geocoded.map((g, i) => `${i + 1}. ${g.addr} — ${g.dist.toFixed(1)}km`),
-        page_result:      resultText.slice(0, 300),
       };
     });
   }
