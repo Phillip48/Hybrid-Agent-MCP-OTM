@@ -271,11 +271,15 @@ async function runTask(ctx, userId, task) {
   const history  = getHistory(userId);
   if (history.length > 0) log(userId, `Resuming conversation — ${history.length / 2} prior exchange(s) in context`);
 
-  const user     = await getUser(userId);
-  const PROVIDER = user.provider || process.env.AI_PROVIDER || 'anthropic';
-  const MODEL    = user.model    || DEFAULT_MODELS[PROVIDER];
+  const user             = await getUser(userId);
+  const configProvider   = user.provider || process.env.AI_PROVIDER || 'anthropic';
+  const configModel      = user.model    || DEFAULT_MODELS[configProvider];
+  // Always try Groq first (free). Fall back to the user's configured provider if Groq fails.
+  const PROVIDER         = 'groq';
+  const MODEL            = DEFAULT_MODELS['groq'];
+  const FALLBACK_PROVIDER = configProvider !== 'groq' ? configProvider : null;
 
-  log(userId, `Provider: ${PROVIDER} | Model: ${MODEL}`);
+  log(userId, `Provider: ${PROVIDER} | Model: ${MODEL}${FALLBACK_PROVIDER ? ` | Fallback: ${FALLBACK_PROVIDER}` : ''}`);
   const browserSession = sessionManager.getOrCreate(userId, {
     otmUser: user.otmUser,
     otmPass: user.otmPass,
@@ -321,10 +325,15 @@ async function runTask(ctx, userId, task) {
         task,
         provider: PROVIDER,
         model: MODEL,
+        fallbackProvider: FALLBACK_PROVIDER,
         systemPrompt: SYSTEM_PROMPT,
         tools: OTM_TOOLS,
         callTool,
         priorMessages: history,
+        onFallback: (fallback, reason) => {
+          log(userId, `Groq failed (${reason}), falling back to ${fallback}`);
+          safeEdit(ctx, statusMsg.message_id, `⚡ Groq failed — retrying with ${fallback}...\n\`\`\`\n${toolLog.join('\n') || '(no tools called yet)'}\n\`\`\``).catch(() => {});
+        },
         onText: (text) => {
           finalText = text;
           turnCount++;
@@ -442,9 +451,14 @@ bot.command('status', async (ctx) => {
     await ctx.reply('Not set up yet. Send /setup to connect your OTM account.');
     return;
   }
-  const active = activeTasks.has(userId) ? '\n🔄 A task is currently running.' : '';
+  const active        = activeTasks.has(userId) ? '\n🔄 A task is currently running.' : '';
+  const fallbackProv  = user.provider || process.env.AI_PROVIDER || 'anthropic';
+  const fallbackModel = user.model    || DEFAULT_MODELS[fallbackProv];
+  const providerLine  = fallbackProv === 'groq'
+    ? `Provider: \`groq\` / \`${DEFAULT_MODELS['groq']}\``
+    : `Provider: \`groq\` → \`${fallbackProv}\` / \`${fallbackModel}\` (fallback)`;
   await ctx.reply(
-    `✅ *Connected*\nAccount: \`${user.otmUser}\`${active}\n\nSend /setup to update credentials.`,
+    `✅ *Connected*\nAccount: \`${user.otmUser}\`\n${providerLine}${active}\n\nSend /setup to update credentials or /setprovider to change fallback.`,
     { parse_mode: 'Markdown' },
   );
 });

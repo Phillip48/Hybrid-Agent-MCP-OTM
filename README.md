@@ -1,6 +1,6 @@
 # Hybrid Browser-Agent / MCP Server for OTM
 
-Automates [Online Territory Manager](https://onlineterritorymanager.com) using Playwright browser automation driven by an AI agent loop. Supports **Anthropic (Claude)**, **OpenAI (GPT-4o)**, and **Groq (Llama)** as interchangeable providers. Also exposes the same OTM actions as an MCP Server for Claude Desktop.
+Automates [Online Territory Manager](https://onlineterritorymanager.com) using Playwright browser automation driven by an AI agent loop. Supports **Anthropic (Claude)**, **OpenAI (GPT-4o)**, and **Groq (Llama)** as interchangeable providers, with **automatic Groq-first fallback** to keep costs low. Also exposes the same OTM actions as an MCP Server for Claude Desktop.
 
 ## Architecture
 
@@ -15,11 +15,11 @@ Automates [Online Territory Manager](https://onlineterritorymanager.com) using P
                    │
 ┌──────────────────▼───────────────────────────────────┐
 │  providers.js  — Unified AI provider abstraction     │
-│  • anthropicLoop  (Anthropic SDK)                    │
-│  • openaiLoop     (OpenAI SDK)                       │
-│  • groqLoop       (Groq SDK — OpenAI-compatible)     │
+│  • groqLoop       (tried first — free tier)          │
+│  • anthropicLoop  (fallback if Groq fails)           │
+│  • openaiLoop     (fallback if Groq fails)           │
 │  Normalizes tool formats and message history for     │
-│  each provider's API.                                │
+│  each provider's API. Automatic provider fallback.   │
 └──────────────────┬───────────────────────────────────┘
                    │
 ┌──────────────────▼───────────────────────────────────┐
@@ -27,7 +27,7 @@ Automates [Online Territory Manager](https://onlineterritorymanager.com) using P
 │  • list_territories   • assign_territory             │
 │  • get_territory      • return_territory             │
 │  • search_territories • list_publishers              │
-│  • get_territory_status • get_publisher              │
+│  • get_territory_status • route_territory            │
 │  • navigate_page      • get_page_content             │
 │  • click_element      • fill_form                    │
 │  • take_screenshot                                   │
@@ -42,6 +42,21 @@ Automates [Online Territory Manager](https://onlineterritorymanager.com) using P
 │  • navigate, click, fill, scrape, evaluate…          │
 └──────────────────────────────────────────────────────┘
 ```
+
+## Provider Strategy
+
+The bot always tries **Groq first** because it's free. If Groq fails (rate limit, token cap, or tool-use error), it automatically retries the same task with your configured fallback provider (default: Anthropic).
+
+```
+Every task → Groq (llama-3.3-70b-versatile)
+                │
+                ├─ success → done
+                └─ failure → fallback provider (anthropic / openai)
+```
+
+- Set your fallback provider in Telegram with `/setprovider anthropic`
+- Set the default fallback in `.env` with `AI_PROVIDER=anthropic`
+- If you set your provider to `groq`, no fallback is used
 
 ## Setup
 
@@ -66,26 +81,26 @@ OTM_USER=your_email@example.com
 OTM_PASS=your_password
 HEADLESS=true                  # set to false to watch the browser
 
-AI_PROVIDER=anthropic          # default provider
+AI_PROVIDER=anthropic          # fallback provider (groq is always tried first)
 
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
-GROQ_API_KEY=gsk_...
+GROQ_API_KEY=gsk_...           # required — Groq is always the first attempt
 
 GEO_KEY=your_geocodio_api_key  # required for route_territory
 ```
 
-You only need the API key for the provider(s) you intend to use.
+You need `GROQ_API_KEY` for all tasks. Add a fallback provider key (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) for reliability on complex tasks.
 
 ## Usage
 
-### Choosing a provider
+### Choosing a provider (CLI)
 
 ```bash
-# Default provider (set AI_PROVIDER in .env, defaults to anthropic)
+# Default: tries Groq first, falls back to AI_PROVIDER from .env
 node index.js "Show me all available territories"
 
-# Explicit provider flag
+# Explicit provider (no fallback)
 node index.js --provider openai "Show me all available territories"
 node index.js --provider groq   "Show me all available territories"
 
@@ -94,16 +109,16 @@ node index.js --provider openai --model gpt-4o-mini "List publishers"
 node index.js --provider groq --model llama-3.3-70b-versatile "Return territory 7"
 
 # Short flags
-node index.js -p groq "Assign territory 42 to Jane Smith"
+node index.js -p anthropic "Assign territory 42 to Jane Smith"
 ```
 
 ### Provider defaults
 
 | Provider | Default model | Notes |
 |----------|--------------|-------|
-| `anthropic` | `claude-sonnet-4-20250514` | Most capable for complex multi-step tasks |
-| `openai` | `gpt-4o` | Strong tool use, widely available |
-| `groq` | `llama-3.3-70b-versatile` | Fastest inference; use `llama-3.3-70b-versatile` or `llama3-groq-70b-8192-tool-use-preview` |
+| `groq` | `llama-3.3-70b-versatile` | Always tried first — free tier, fastest inference |
+| `anthropic` | `claude-sonnet-4-20250514` | Recommended fallback — best for complex multi-step tasks |
+| `openai` | `gpt-4o` | Alternative fallback — strong tool use |
 
 ### Example tasks
 
@@ -113,12 +128,13 @@ node index.js "What territories does Jane Smith currently have?"
 node index.js "Assign territory 42 to John Doe"
 node index.js "Return territory 15 — it came back today"
 node index.js "List all territories checked out for more than 4 months"
+node index.js "Route territory OR-15A"
 
 # Pipe from stdin
-echo "List publishers in group 3" | node index.js --provider groq
+echo "List publishers in group 3" | node index.js
 
 # Interactive prompt
-node index.js --provider openai
+node index.js
 # > Enter OTM task: _
 ```
 
@@ -192,7 +208,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 1. **On first run** the agent logs in with your OTM credentials and saves the session cookies to `cookies.json`.
 2. **On subsequent runs** the saved cookies are loaded — login is skipped unless the session has expired.
-3. **The agentic loop** sends your task to the chosen AI model with all 13 OTM tools available. The model reasons through the task, calls tools, reads results, and iterates until done (max 20 turns).
+3. **The agentic loop** sends your task to Groq first. If Groq fails for any reason, the full task is retried automatically with your configured fallback provider (Anthropic by default).
 4. **Tool format normalization** — `providers.js` converts the OTM tool definitions to each provider's format (Anthropic `input_schema` vs OpenAI/Groq `parameters`) and translates their different message history structures transparently.
 5. **Errors are surfaced gracefully** — Playwright failures are returned as tool results so the model can retry with a different approach.
 
@@ -205,8 +221,8 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | Login fails | Check `OTM_USER` / `OTM_PASS`; set `HEADLESS=false` to watch |
 | "Element not found" | Use `take_screenshot` or `get_page_content` to inspect the page |
 | Session keeps expiring | Delete `cookies.json` to force a fresh login |
-| Groq tool-use errors | Some Groq models have limited tool support — try `llama-3.3-70b-versatile` |
-| OpenAI rate limits | Use `--model gpt-4o-mini` for lighter tasks |
+| Groq keeps failing | Set `AI_PROVIDER=anthropic` in `.env` as the fallback; Groq will still be tried first |
+| Task fails on both providers | Check API keys in `.env`; try `--provider anthropic` directly |
 
 ---
 
@@ -214,7 +230,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```
 ├── index.js              CLI entry point — parses --provider / --model flags
-├── providers.js          Unified AI provider abstraction (Anthropic, OpenAI, Groq)
+├── providers.js          Unified AI provider abstraction (Groq-first + fallback)
 ├── mcp-server.js         OTM tool implementations + MCP Server (stdio)
 ├── browser.js            Playwright session manager
 ├── .env                  Credentials and API keys (never commit this)

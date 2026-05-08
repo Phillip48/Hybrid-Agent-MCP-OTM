@@ -194,32 +194,47 @@ async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, on
 }
 
 /**
- * Run the full agentic loop for a given provider.
+ * Run the full agentic loop for a given provider, with optional fallback.
  *
  * @param {object} opts
- * @param {string}   opts.task         Plain-English task string.
- * @param {string}   opts.provider     'anthropic' | 'openai' | 'groq'
- * @param {string}  [opts.model]       Model override. Defaults to DEFAULT_MODELS[provider].
- * @param {string}   opts.systemPrompt System prompt text.
- * @param {Array}    opts.tools        OTM_TOOLS array from mcp-server.js.
- * @param {Function} opts.callTool     async (name, args) => result
- * @param {Function} [opts.onText]     Called with each text chunk from the model.
- * @param {Function} [opts.onToolCall] Called with (name, input) before execution.
- * @param {Function} [opts.onToolResult] Called with (name, resultText) after execution.
+ * @param {string}   opts.task             Plain-English task string.
+ * @param {string}   opts.provider         'anthropic' | 'openai' | 'groq'
+ * @param {string}  [opts.model]           Model override. Defaults to DEFAULT_MODELS[provider].
+ * @param {string}  [opts.fallbackProvider] Provider to use if the primary fails.
+ * @param {string}   opts.systemPrompt     System prompt text.
+ * @param {Array}    opts.tools            OTM_TOOLS array from mcp-server.js.
+ * @param {Function} opts.callTool         async (name, args) => result
+ * @param {Function} [opts.onText]         Called with each text chunk from the model.
+ * @param {Function} [opts.onToolCall]     Called with (name, input) before execution.
+ * @param {Function} [opts.onToolResult]   Called with (name, resultText) after execution.
+ * @param {Function} [opts.onFallback]     Called with (fallbackProvider, errorMessage) when falling back.
  */
 export async function runAgentLoop(opts) {
   const provider = opts.provider ?? 'anthropic';
-  const model = opts.model ?? DEFAULT_MODELS[provider];
+  const model    = opts.model ?? DEFAULT_MODELS[provider];
+  const fallback = opts.fallbackProvider;
 
   if (!PROVIDERS.includes(provider)) {
     throw new Error(`Unknown provider "${provider}". Choose from: ${PROVIDERS.join(', ')}`);
   }
 
-  const args = { ...opts, model };
+  function runWith(p, m) {
+    const args = { ...opts, provider: p, model: m };
+    switch (p) {
+      case 'anthropic': return anthropicLoop(args);
+      case 'openai':    return openaiLoop(args);
+      case 'groq':      return groqLoop(args);
+    }
+  }
 
-  switch (provider) {
-    case 'anthropic': return anthropicLoop(args);
-    case 'openai':    return openaiLoop(args);
-    case 'groq':      return groqLoop(args);
+  try {
+    return await runWith(provider, model);
+  } catch (e) {
+    if (fallback && fallback !== provider) {
+      console.warn(`[Agent] ${provider} failed (${e.message}) — falling back to ${fallback}`);
+      opts.onFallback?.(fallback, e.message);
+      return runWith(fallback, DEFAULT_MODELS[fallback]);
+    }
+    throw e;
   }
 }
