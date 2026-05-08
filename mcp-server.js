@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import 'dotenv/config';
 import { fileURLToPath } from 'url';
+import { readFileSync, writeFileSync } from 'fs';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -874,47 +875,71 @@ export function createCallTool(session) {
     return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
   }
 
-  // Geocodes a US address using two fast, free services with no meaningful rate limits.
-  // Strategy 1 — US Census Geocoder: purpose-built for US addresses, very reliable, no key needed.
-  // Strategy 2 — Photon (Komoot): OSM-based, location-biased to Central FL, no key needed.
-  async function geocodeAddress(rawAddress) {
-    // Strip unit designators before querying (APT 2, UNIT B, #4, STE 100, etc.)
-    const clean = rawAddress.replace(/\s+(apt|unit|ste|suite|#|lot)\s*\S+/gi, '').trim();
-    const withFL = (q) => /\bfl\b|\bflorida\b/i.test(q) ? q : `${q}, FL`;
+  // Geocode cache — persisted to disk so addresses are never geocoded twice.
+  const CACHE_PATH = new URL('./geocode-cache.json', import.meta.url).pathname;
+  function loadCache() {
+    try { return JSON.parse(readFileSync(CACHE_PATH, 'utf8')); } catch { return {}; }
+  }
+  function saveCache(cache) {
+    try { writeFileSync(CACHE_PATH, JSON.stringify(cache, null, 2)); } catch {}
+  }
 
-    // ── Strategy 1: US Census Geocoder ──────────────────────────────────────
-    try {
-      const q    = encodeURIComponent(withFL(clean));
-      const url  = `https://geocoding.geo.census.gov/geocoder/locations/onelineaddress?address=${q}&benchmark=Public_AR_Current&format=json`;
-      const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-      const data = await resp.json();
-      const match = data?.result?.addressMatches?.[0];
-      if (match) {
-        console.log(`[route]   ✓ Census hit: ${match.matchedAddress}`);
-        return { lat: match.coordinates.y, lon: match.coordinates.x };
+  // Batch-geocodes an array of address strings via Geocodio.
+  // Returns a map of { address -> { lat, lon } | null }.
+  // Already-cached addresses are skipped entirely (no API call).
+  async function batchGeocode(addresses) {
+    const cache  = loadCache();
+    const hits   = {};
+    const misses = [];
+
+    for (const addr of addresses) {
+      if (cache[addr]) {
+        hits[addr] = cache[addr];
+      } else {
+        misses.push(addr);
       }
-    } catch (e) {
-      console.warn(`[route]   Census error: ${e.message}`);
     }
 
-    // ── Strategy 2: Photon (Komoot) — OSM-based, biased to Central FL ───────
-    try {
-      const q    = encodeURIComponent(withFL(clean));
-      // lat/lon bias toward Kissimmee; radius keeps results in the right area
-      const url  = `https://photon.komoot.io/api/?q=${q}&limit=1&lat=28.307&lon=-81.422&lang=en`;
-      const resp = await fetch(url, { headers: { 'User-Agent': 'OTM-Bot/1.0' }, signal: AbortSignal.timeout(8000) });
-      const data = await resp.json();
-      const feat = data?.features?.[0];
-      if (feat) {
-        const [lon, lat] = feat.geometry.coordinates;
-        console.log(`[route]   ✓ Photon hit: ${feat.properties.name ?? clean}`);
-        return { lat, lon };
-      }
-    } catch (e) {
-      console.warn(`[route]   Photon error: ${e.message}`);
+    if (misses.length === 0) {
+      console.log(`[route] All ${addresses.length} addresses resolved from cache`);
+      return hits;
     }
 
-    return null;
+    console.log(`[route] ${hits ? Object.keys(hits).length : 0} cached, ${misses.length} need geocoding via Geocodio...`);
+
+    const apiKey = process.env.GEO_KEY;
+    if (!apiKey) throw new Error('GEO_KEY not set in .env');
+
+    const resp = await fetch(
+      `https://api.geocod.io/v1.7/geocode?api_key=${apiKey}&limit=1`,
+      {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(misses),
+        signal:  AbortSignal.timeout(30000),
+      }
+    );
+
+    if (!resp.ok) throw new Error(`Geocodio error ${resp.status}: ${await resp.text()}`);
+
+    const data = await resp.json();
+
+    for (let i = 0; i < misses.length; i++) {
+      const addr  = misses[i];
+      const match = data.results?.[i]?.response?.results?.[0];
+      if (match?.location) {
+        const coords = { lat: match.location.lat, lon: match.location.lng };
+        hits[addr]   = coords;
+        cache[addr]  = coords;
+        console.log(`[route]   ✓ ${addr}`);
+      } else {
+        hits[addr] = null;
+        console.warn(`[route]   ✗ no result: ${addr}`);
+      }
+    }
+
+    saveCache(cache);
+    return hits;
   }
 
   async function handleRouteTerritory({ territory_number }) {
@@ -975,30 +1000,21 @@ export function createCallTool(session) {
         return li.text.replace(/^\d+:\s*/, '').replace(/[\s,]*\*?\s*$/, '').trim();
       });
 
-      // ── Step 5: Geocode all addresses — Census first, Photon fallback ───────
-      // Must complete ALL geocoding before sorting or saving.
-      const sleep    = (ms) => new Promise(r => setTimeout(r, ms));
+      // ── Step 5: Batch-geocode via Geocodio (cached addresses skipped) ────────
+      const coordMap = await batchGeocode(cleanAddresses);
       const geocoded = [];
       const failed   = [];
-      console.log(`[route] Geocoding ${liItems.length} addresses (Census → Photon fallback)...`);
 
       for (let i = 0; i < liItems.length; i++) {
         const addr   = cleanAddresses[i];
-        console.log(`[route] ${i + 1}/${liItems.length} geocoding: ${addr}`);
-        const coords = await geocodeAddress(addr);
+        const coords = coordMap[addr];
         const dist   = coords ? haversineKm(HOME_LAT, HOME_LON, coords.lat, coords.lon) : 9999;
-        if (coords) {
-          console.log(`[route] ${i + 1}/${liItems.length} ✓ ${addr} — ${dist.toFixed(1)}km`);
-        } else {
-          console.warn(`[route] ${i + 1}/${liItems.length} ✗ FAILED both services: ${addr}`);
-          failed.push(addr);
-        }
+        if (!coords) failed.push(addr);
         geocoded.push({ id: liItems[i].id, addr, dist, coords });
-        if (i < liItems.length - 1) await sleep(300); // small polite gap between addresses
       }
 
       if (failed.length > 0) {
-        console.warn(`[route] WARNING: ${failed.length} address(es) could not be geocoded and will sort last:`);
+        console.warn(`[route] ${failed.length} address(es) not geocoded — will sort to end:`);
         failed.forEach(a => console.warn(`  - ${a}`));
       }
 

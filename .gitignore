@@ -1,5 +1,6 @@
 node_modules/
 cookies.json
+geocode-cache.json
 cookies/
 data/
 .env
