@@ -61,6 +61,7 @@ You (Telegram) ──► bot.js ──► runAgentLoop() ──► AI Model (Cla
 | `index.js` | CLI entry point — run tasks without Telegram, supports `--provider` flag |
 | `.env` | All credentials and API keys (never committed) |
 | `COMMANDS.txt` | Quick command reference |
+| `geocode-cache.json` | Persistent address → coordinates cache for `route_territory` (auto-generated, gitignored) |
 | `data/users.json` | Encrypted user credentials (auto-generated, gitignored) |
 | `cookies/<userId>.json` | Per-user browser sessions (auto-generated, gitignored) |
 
@@ -376,7 +377,7 @@ Lists all campaigns (`CampaignAdmin.php`).
 ### Route Territory
 
 #### `route_territory`
-Automatically routes a territory's addresses from closest to farthest from the congregation home base (1675 Jack Calhoun Dr, Kissimmee FL 34741).
+Automatically routes a territory's addresses in a logical driving order starting from the congregation home base (1675 Jack Calhoun Dr, Kissimmee FL 34741) using Geocodio batch geocoding and a nearest-neighbor path algorithm.
 
 **Steps:**
 1. Navigates to `TerRoute.php`
@@ -384,14 +385,15 @@ Automatically routes a territory's addresses from closest to farthest from the c
 3. Sets the select value and clicks `Edit Route` (`input[name="Route"]`)
 4. Waits for the routing page to load — this shows `#dragbox` with `<li id="ADDRESS_ID">` elements
 5. Reads all address IDs and text from `#dragbox` plus cleaner text from the `copypaste` textarea
-6. Geocodes each address using OpenStreetMap Nominatim API (700ms between requests to respect rate limits)
-7. Calculates Haversine distance from home base coordinates (28.307192, -81.422605) for each address
-8. Sorts addresses closest → farthest
-9. Reorders the `#dragbox` DOM by calling `parent.appendChild(li)` for each address in sorted order — no drag simulation needed
-10. Clicks `Save Route` — the button's `onclick="dosave()"` fires first, which reads all `<li>` IDs in current DOM order into the `RouteOrder` hidden field, then the form submits
-11. Returns the sorted route order with distances
+6. **Geocoding (batch, with cache):** Checks `geocode-cache.json` for previously resolved addresses. Any unknown addresses are sent in a single POST to the Geocodio batch API (`GEO_KEY`). Results are merged with cache hits and the cache is updated — addresses are never geocoded twice
+7. **Nearest-neighbor routing:** Starting at the home base, greedily selects the closest unvisited address at each step using the Haversine formula. Produces a logical driving path (no zigzagging). Addresses that failed to geocode are appended at the end
+8. Reorders the `#dragbox` DOM by calling `parent.appendChild(li)` for each address in sorted order — no drag simulation needed
+9. Clicks `Save Route` — the button's `onclick="dosave()"` fires first, which reads all `<li>` IDs in current DOM order into the `RouteOrder` hidden field, then the form submits
+10. Returns the sorted route order with distances
 
-**Note:** Geocoding takes ~700ms per address. A territory with 40 addresses takes ~28 seconds. Tasks with "route" in the message automatically get a 4-minute timeout.
+**Note:** First run geocodes all addresses in one Geocodio batch request (~2–5 seconds total). Subsequent runs for the same territory are instant thanks to the cache. Tasks with "route" in the message automatically get a 4-minute timeout.
+
+**Requires:** `GEO_KEY` (Geocodio API key) in `.env`.
 
 **Example:** *"Route territory OR-15A"*
 
@@ -515,6 +517,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | `ANTHROPIC_API_KEY` | If using Anthropic | From console.anthropic.com |
 | `OPENAI_API_KEY` | If using OpenAI | From platform.openai.com |
 | `GROQ_API_KEY` | If using Groq | From console.groq.com |
+| `GEO_KEY` | For `route_territory` | Geocodio API key — get one at geocod.io |
 | `TELEGRAM_BOT_TOKEN` | Bot only | From @BotFather on Telegram |
 | `TELEGRAM_ADMIN_IDS` | Bot only | Your Telegram numeric ID (comma-separated for multiple) |
 | `STORE_KEY` | Bot only | 64-char hex key for AES-256-GCM credential encryption |

@@ -23,6 +23,7 @@ ADMIN COMMANDS (your Telegram ID only)
   /allow <id>         Allow a user to register with the bot.
   /deny <id>          Remove a user's access.
   /users              List all registered users and their status.
+  /restart            Restart the bot process (PM2 will auto-restart it).
 
 --------------------------------------------------------------------------------
 EXAMPLE OTM TASKS (send as plain messages)
@@ -38,6 +39,7 @@ TERRITORIES
   Show me all checked-out territories
   Assign territory OR-15A to Phillip Pereira
   Return territory OR-15A
+  Route territory OR-15A
 
 REPORTS
   Pull a report of total confirmed addresses
@@ -115,6 +117,7 @@ MCP SERVER (for Claude Desktop)
   ANTHROPIC_API_KEY     API key from console.anthropic.com
   OPENAI_API_KEY        API key from platform.openai.com
   GROQ_API_KEY          API key from console.groq.com
+  GEO_KEY               Geocodio API key (required for route_territory)
   TELEGRAM_BOT_TOKEN    Token from @BotFather on Telegram
   TELEGRAM_ADMIN_IDS    Your Telegram user ID (comma-separated for multiple)
   STORE_KEY             64-char hex key for encrypting stored credentials

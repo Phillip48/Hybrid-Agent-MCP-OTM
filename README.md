@@ -71,6 +71,8 @@ AI_PROVIDER=anthropic          # default provider
 ANTHROPIC_API_KEY=sk-ant-...
 OPENAI_API_KEY=sk-...
 GROQ_API_KEY=gsk_...
+
+GEO_KEY=your_geocodio_api_key  # required for route_territory
 ```
 
 You only need the API key for the provider(s) you intend to use.
@@ -177,6 +179,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | `return_territory` | Mark a territory as returned |
 | `list_publishers` | List congregation publishers; optional `group_filter` |
 | `get_publisher` | Details and territory history for a publisher |
+| `route_territory` | Routes a territory's addresses in optimal driving order from home base using Geocodio + nearest-neighbor |
 | `navigate_page` | Navigate to any OTM path or URL |
 | `get_page_content` | Get visible text of the current page |
 | `click_element` | Click an element by CSS selector or `text=...` |
@@ -210,12 +213,13 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ## File reference
 
 ```
-├── index.js          CLI entry point — parses --provider / --model flags
-├── providers.js      Unified AI provider abstraction (Anthropic, OpenAI, Groq)
-├── mcp-server.js     OTM tool implementations + MCP Server (stdio)
-├── browser.js        Playwright session manager
-├── .env              Credentials and API keys (never commit this)
-├── cookies.json      Saved browser session (auto-generated, gitignored)
-├── package.json      ES module config + dependencies
-└── README.md         This file
+├── index.js              CLI entry point — parses --provider / --model flags
+├── providers.js          Unified AI provider abstraction (Anthropic, OpenAI, Groq)
+├── mcp-server.js         OTM tool implementations + MCP Server (stdio)
+├── browser.js            Playwright session manager
+├── .env                  Credentials and API keys (never commit this)
+├── cookies.json          Saved browser session (auto-generated, gitignored)
+├── geocode-cache.json    Persistent address → coordinates cache (auto-generated, gitignored)
+├── package.json          ES module config + dependencies
+└── README.md             This file
 ```

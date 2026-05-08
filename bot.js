@@ -578,6 +578,14 @@ bot.command('users', async (ctx) => {
   await ctx.reply(`*Users:*\n${lines.join('\n')}`, { parse_mode: 'Markdown' });
 });
 
+bot.command('restart', async (ctx) => {
+  const adminId = String(ctx.from.id);
+  if (!isAdmin(adminId)) { await ctx.reply('❌ Admin only.'); return; }
+  log(adminId, '/restart');
+  await ctx.reply('🔄 Restarting bot...');
+  setTimeout(() => process.exit(0), 500);
+});
+
 // ── Main message handler ──────────────────────────────────────────────────────
 
 bot.on(message('text'), async (ctx) => {
