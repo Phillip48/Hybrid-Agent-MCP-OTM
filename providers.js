@@ -161,7 +161,7 @@ async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, 
 
   // Retry each API call up to 3 times with exponential backoff (15s → 30s → 60s).
   const geminiRequest = async () => {
-    const delays = [15000, 30000, 60000];
+    const delays = [8000, 20000];
     for (let attempt = 0; ; attempt++) {
       try {
         return await client.chat.completions.create({
@@ -177,7 +177,7 @@ async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, 
         const isRateLimit = status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate');
         if (isRateLimit && attempt < delays.length) {
           const wait = delays[attempt];
-          console.warn(`[Agent] Gemini 429 — waiting ${wait / 1000}s before retry ${attempt + 1}/${delays.length}...`);
+          console.warn(`[Agent] Gemini 429 — waiting ${wait / 1000}s before retry ${attempt + 1} of ${delays.length}...`);
           await new Promise(r => setTimeout(r, wait));
         } else {
           throw e;
