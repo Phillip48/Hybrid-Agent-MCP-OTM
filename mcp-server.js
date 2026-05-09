@@ -1119,93 +1119,78 @@ export function createCallTool(session) {
 
   async function handleAddAddress({ street_number, street_name, unit, city, state = 'FL', zip, confirmed = false } = {}) {
     return withBrowser(async () => {
-      const fullAddress = `${street_number} ${street_name}${unit ? ` ${unit}` : ''}${city ? `, ${city}` : ''}${zip ? ` ${zip}` : ''}`.trim();
-      console.log(`[add_address] Checking if "${fullAddress}" already exists`);
+      const numStr      = String(street_number).trim();
+      const fullAddress = `${numStr} ${street_name}${unit ? ` ${unit}` : ''}${city ? `, ${city}` : ''}${zip ? ` ${zip}` : ''}`.trim();
+      console.log(`[add_address] Step 1 — searching for "${fullAddress}"`);
 
-      // ── Step 1: Search by street number + street name only ───────────────
+      // ── Step 1: Search by house number + street name ─────────────────────
       await session.navigate(PAGES.addrSearch);
 
-      try { await session.fill('input[name="Addr"]',   street_number); } catch {}
-      try { await session.fill('input[name="Street"]', street_name);   } catch {}
+      // AddrSearch.php uses 'housenum'/'street' (lowercase) — try both conventions.
+      for (const sel of ['input[name="housenum"]', 'input[name="Addr"]']) {
+        try { await session.fill(sel, numStr); break; } catch {}
+      }
+      for (const sel of ['input[name="street"]', 'input[name="Street"]']) {
+        try { await session.fill(sel, street_name); break; } catch {}
+      }
 
       await session.evaluate(() => {
         const btn = document.querySelector('input[type="submit"], button[type="submit"]');
         if (btn) btn.click();
       });
-      await session.page.waitForLoadState('domcontentloaded');
-
-      const searchRows = await session.evaluate(() =>
-        [...document.querySelectorAll('table tbody tr')]
-          .map(r => r.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean)
+      await session.page.waitForLoadState('networkidle').catch(() =>
+        session.page.waitForLoadState('domcontentloaded').catch(() => {})
       );
 
-      // Check if any result row contains this exact street number.
-      const numStr  = String(street_number).trim();
-      const matchingRow = searchRows.find(row => {
-        const parts = row.split(/\s+/);
-        return parts[0] === numStr || parts.some(p => p === numStr);
-      });
-
-      if (matchingRow) {
-        console.log(`[add_address] Already exists — "${matchingRow}". Stopping.`);
-        return {
-          error: true,
-          already_exists: true,
-          message: `This address already exists in OTM and was not added. Found: "${matchingRow}"`,
-        };
+      // Use scrapeTable (same robust logic as search_addresses tool).
+      const table = await session.scrapeTable('table');
+      if (table?.rows?.length) {
+        const match = table.rows.find(row => {
+          const vals = Object.values(row).map(v => String(v ?? '').trim());
+          return vals.some(v => v === numStr || v.toLowerCase().startsWith(numStr + ' '));
+        });
+        if (match) {
+          console.log(`[add_address] Already exists — ${JSON.stringify(match)}. Stopping.`);
+          return {
+            error: true,
+            already_exists: true,
+            message: `Address already exists in OTM — not added. Found: ${Object.values(match).join(', ')}`,
+          };
+        }
+        console.log(`[add_address] ${table.rows.length} result(s) for street — house number ${numStr} not among them. Proceeding to add.`);
+      } else {
+        console.log(`[add_address] No results for street "${street_name}". Proceeding to add.`);
       }
 
-      console.log(`[add_address] ${searchRows.length} result(s) for street but none matched house number ${street_number} — proceeding to add`);
-
-      // ── Step 2: Navigate directly to AdminSingleAddr.php ─────────────────
+      // ── Step 2: Fill the add form and save ───────────────────────────────
+      console.log(`[add_address] Step 2 — navigating to add form`);
       await session.navigate(PAGES.addrEntry);
       await session.page.waitForLoadState('domcontentloaded');
 
-      // ── Step 3: Fill form fields (exact names from AdminSingleAddr.php) ───
-      // House number → Addr field
-      await session.fill('input[name="Addr"]',   street_number);
-      // Street name → Street field
+      await session.fill('input[name="Addr"]',   numStr);
       await session.fill('input[name="Street"]', street_name);
-      // Apt/unit (optional)
-      if (unit) {
-        try { await session.fill('input[name="Apt"]', unit); } catch {}
-      }
-      // City, State, Zip
-      if (city) await session.fill('input[name="City"]',  city);
-      await session.fill('input[name="State"]', state);
-      if (zip)  await session.fill('input[name="Zip"]',   zip);
+      if (unit) try { await session.fill('input[name="Apt"]', unit); } catch {}
+      if (city) try { await session.fill('input[name="City"]', city); } catch {}
+      try { await session.fill('input[name="State"]', state); } catch {}
+      if (zip)  try { await session.fill('input[name="Zip"]',  zip); } catch {}
 
-      console.log(`[add_address] Form filled — ${street_number} ${street_name}${unit ? ` ${unit}` : ''}, ${city ?? ''} ${state} ${zip ?? ''}`);
-
-      // Language is already set to Portuguese via hidden field — no action needed.
-
-      // ── Step 4: Mark confirmed if requested ───────────────────────────────
       if (confirmed) {
         await session.evaluate(() => {
           const sel = document.querySelector('select[name="Confirmed"]');
           if (sel) { sel.value = '1'; sel.dispatchEvent(new Event('change', { bubbles: true })); }
         });
-        console.log(`[add_address] Marked as confirmed`);
       }
 
-      // ── Step 5: Click Get Lat/Long ────────────────────────────────────────
-      console.log(`[add_address] Clicking Get Lat/Long`);
+      // Get Lat/Long (best effort — don't fail if it times out).
       try {
         await session.page.click('input[type="button"][value="Get Lat/Long"]');
-        // Wait up to 12s for lat field to populate.
         await session.page.waitForFunction(
           () => { const el = document.getElementById('Lat'); return el && el.value && el.value !== ''; },
-          { timeout: 12000 }
-        ).catch(() => console.warn(`[add_address] Lat/Long did not populate — saving anyway`));
-        const lat = await session.evaluate(() => document.getElementById('Lat')?.value);
-        const lng = await session.evaluate(() => document.getElementById('Lng')?.value);
-        console.log(`[add_address] Lat/Long: ${lat}, ${lng}`);
-      } catch (e) {
-        console.warn(`[add_address] Get Lat/Long click failed: ${e.message}`);
-      }
+          { timeout: 10000 }
+        ).catch(() => {});
+      } catch {}
 
-      // ── Step 6: Click Save ────────────────────────────────────────────────
-      console.log(`[add_address] Clicking Save`);
+      // Save.
       await session.page.click('input[name="save"]');
       await session.page.waitForLoadState('networkidle').catch(() => {});
 
@@ -1213,12 +1198,9 @@ export function createCallTool(session) {
       const success    = /success|saved|added|record/i.test(resultText);
       console.log(`[add_address] Save result: ${success ? 'success' : 'unclear'}`);
 
-      return {
-        success,
-        address: fullAddress,
-        confirmed,
-        result: resultText.slice(0, 500),
-      };
+      return success
+        ? { success: true,  address: fullAddress, message: 'Address added successfully.' }
+        : { success: false, address: fullAddress, message: `Save result unclear. Page text: ${resultText.slice(0, 300)}` };
     });
   }
 
