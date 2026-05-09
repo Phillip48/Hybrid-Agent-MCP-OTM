@@ -79,25 +79,34 @@ function err(userId, ...args)  { console.error(`[bot:${userId}]`, ...args); }
 
 // ── Provider probe ────────────────────────────────────────────────────────────
 
+let geminiProbeCache = null; // { result, ts }
+const GEMINI_PROBE_TTL = 60_000; // reuse result for 60s to avoid burning RPM slots
+
 async function probeGemini() {
+  if (geminiProbeCache && Date.now() - geminiProbeCache.ts < GEMINI_PROBE_TTL) {
+    return { ...geminiProbeCache.result, cached: true };
+  }
   const client = new OpenAI({
     baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
     apiKey: process.env.GEMINI_API_KEY,
   });
   const t0 = Date.now();
+  let result;
   try {
     await client.chat.completions.create({
       model: DEFAULT_MODELS.gemini,
       max_tokens: 1,
       messages: [{ role: 'user', content: 'hi' }],
     });
-    return { ok: true, ms: Date.now() - t0 };
+    result = { ok: true, ms: Date.now() - t0 };
   } catch (e) {
     const status = e?.status ?? e?.response?.status;
     const body   = e?.message || '';
     const isRateLimit = status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate');
-    return { ok: false, rateLimit: isRateLimit, ms: Date.now() - t0, error: body.slice(0, 120) };
+    result = { ok: false, rateLimit: isRateLimit, ms: Date.now() - t0, error: body.slice(0, 120) };
   }
+  geminiProbeCache = { result, ts: Date.now() };
+  return result;
 }
 
 // ── Misc helpers ──────────────────────────────────────────────────────────────
@@ -369,6 +378,10 @@ async function runTask(ctx, userId, task) {
         priorMessages: history,
         onFallback: (fallback, reason) => {
           log(userId, `Provider failed (${reason}), switching to ${fallback}`);
+          // If Gemini just rate-limited, mark the probe cache so /status shows it immediately.
+          if (reason.toLowerCase().includes('gemini') || (fallback !== 'gemini' && reason.toLowerCase().includes('rate'))) {
+            geminiProbeCache = { result: { ok: false, rateLimit: true, ms: 0, error: reason.slice(0, 120) }, ts: Date.now() };
+          }
           safeEdit(ctx, statusMsg.message_id, `⚡ Switching to ${fallback}...\n\`\`\`\n${toolLog.join('\n') || '(no tools called yet)'}\n\`\`\``).catch(() => {});
         },
         onText: (text) => {
@@ -492,11 +505,12 @@ bot.command('status', async (ctx) => {
   const msg = await ctx.reply('⏳ Checking providers...');
 
   const [geminiResult] = await Promise.all([probeGemini()]);
+  const cachedNote = geminiResult.cached ? ' _(cached)_' : '';
   const geminiStatus = geminiResult.ok
-    ? `✅ Gemini OK (${geminiResult.ms}ms)`
+    ? `✅ Gemini OK (${geminiResult.ms}ms)${cachedNote}`
     : geminiResult.rateLimit
-      ? `⚠️ Gemini rate-limited (429)`
-      : `❌ Gemini error: ${geminiResult.error}`;
+      ? `⚠️ Gemini rate-limited (429)${cachedNote}`
+      : `❌ Gemini error: ${geminiResult.error}${cachedNote}`;
 
   const active       = activeTasks.has(userId) ? '\n🔄 A task is currently running.' : '';
   const lastFallback = user.provider || process.env.AI_PROVIDER || 'anthropic';
