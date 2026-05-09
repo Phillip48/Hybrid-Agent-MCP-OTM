@@ -6,6 +6,7 @@ import { getUser, setUser, getAllUsers, isAllowed, isRegistered } from './store.
 import sessionManager from './sessions.js';
 import { OTM_TOOLS, createCallTool } from './mcp-server.js';
 import { runAgentLoop, DEFAULT_MODELS, PROVIDERS } from './providers.js';
+import OpenAI from 'openai';
 import { OTM_KNOWLEDGE } from './otm-knowledge.js';
 import { BrowserSession } from './browser.js';
 
@@ -60,9 +61,44 @@ function clearHistory(userId) {
 
 // ── Logging helpers ───────────────────────────────────────────────────────────
 
-function log(userId, ...args)  { console.log( `[bot:${userId}]`, ...args); }
+const LOG_RING = []; // circular buffer of recent log lines (newest last)
+const LOG_RING_MAX = 30;
+
+function pushLog(line) {
+  LOG_RING.push(line);
+  if (LOG_RING.length > LOG_RING_MAX) LOG_RING.shift();
+}
+
+function log(userId, ...args)  {
+  const line = `[bot:${userId}] ${args.join(' ')}`;
+  console.log(line);
+  pushLog(line);
+}
 function warn(userId, ...args) { console.warn( `[bot:${userId}]`, ...args); }
 function err(userId, ...args)  { console.error(`[bot:${userId}]`, ...args); }
+
+// ── Provider probe ────────────────────────────────────────────────────────────
+
+async function probeGemini() {
+  const client = new OpenAI({
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    apiKey: process.env.GEMINI_API_KEY,
+  });
+  const t0 = Date.now();
+  try {
+    await client.chat.completions.create({
+      model: DEFAULT_MODELS.gemini,
+      max_tokens: 1,
+      messages: [{ role: 'user', content: 'hi' }],
+    });
+    return { ok: true, ms: Date.now() - t0 };
+  } catch (e) {
+    const status = e?.status ?? e?.response?.status;
+    const body   = e?.message || '';
+    const isRateLimit = status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate');
+    return { ok: false, rateLimit: isRateLimit, ms: Date.now() - t0, error: body.slice(0, 120) };
+  }
+}
 
 // ── Misc helpers ──────────────────────────────────────────────────────────────
 
@@ -452,14 +488,29 @@ bot.command('status', async (ctx) => {
     await ctx.reply('Not set up yet. Send /setup to connect your OTM account.');
     return;
   }
+
+  const msg = await ctx.reply('⏳ Checking providers...');
+
+  const [geminiResult] = await Promise.all([probeGemini()]);
+  const geminiStatus = geminiResult.ok
+    ? `✅ Gemini OK (${geminiResult.ms}ms)`
+    : geminiResult.rateLimit
+      ? `⚠️ Gemini rate-limited (429)`
+      : `❌ Gemini error: ${geminiResult.error}`;
+
   const active       = activeTasks.has(userId) ? '\n🔄 A task is currently running.' : '';
   const lastFallback = user.provider || process.env.AI_PROVIDER || 'anthropic';
   const chain        = ['gemini', 'groq', lastFallback].filter((v, i, a) => a.indexOf(v) === i);
-  const providerLine = `Provider chain: \`${chain.join(' → ')}\``;
-  await ctx.reply(
-    `✅ *Connected*\nAccount: \`${user.otmUser}\`\n${providerLine}${active}\n\nSend /setup to update credentials or /setprovider to change last-resort fallback.`,
-    { parse_mode: 'Markdown' },
-  );
+  const providerLine = `Chain: \`${chain.join(' → ')}\``;
+
+  const recentLogs = LOG_RING.slice(-15).join('\n') || '(no recent activity)';
+
+  const statusText = `*OTM Bot Status*\n\nAccount: \`${user.otmUser}\`\n${providerLine}\n${geminiStatus}${active}\n\n*Recent logs:*\n\`\`\`\n${recentLogs}\n\`\`\`\n\nSend /setup to update credentials or /setprovider to change fallback.`;
+  try {
+    await ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, statusText, { parse_mode: 'Markdown' });
+  } catch {
+    await ctx.reply(statusText, { parse_mode: 'Markdown' });
+  }
 });
 
 bot.command('cancel', async (ctx) => {
