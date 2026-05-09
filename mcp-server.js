@@ -1120,13 +1120,11 @@ export function createCallTool(session) {
       const fullAddress = `${street_number} ${street_name}${unit ? ` ${unit}` : ''}${city ? `, ${city}` : ''}${zip ? ` ${zip}` : ''}`.trim();
       console.log(`[add_address] Checking if "${fullAddress}" already exists`);
 
-      // ── Step 1: Search AddrSearch.php for duplicates ──────────────────────
+      // ── Step 1: Search by street number + street name only ───────────────
       await session.navigate(PAGES.addrSearch);
 
-      // Fill street number + street name — the most reliable duplicate signal.
       try { await session.fill('input[name="Addr"]',   street_number); } catch {}
       try { await session.fill('input[name="Street"]', street_name);   } catch {}
-      if (city) { try { await session.fill('input[name="City"]', city); } catch {} }
 
       await session.evaluate(() => {
         const btn = document.querySelector('input[type="submit"], button[type="submit"]');
@@ -1134,21 +1132,28 @@ export function createCallTool(session) {
       });
       await session.page.waitForLoadState('domcontentloaded');
 
-      const searchResults = await session.evaluate(() =>
+      const searchRows = await session.evaluate(() =>
         [...document.querySelectorAll('table tbody tr')]
           .map(r => r.innerText.replace(/\s+/g, ' ').trim()).filter(Boolean)
       );
 
-      if (searchResults.length > 0) {
-        console.log(`[add_address] Already exists — ${searchResults.length} record(s). Stopping.`);
+      // Check if any result row contains this exact street number.
+      const numStr  = String(street_number).trim();
+      const matchingRow = searchRows.find(row => {
+        const parts = row.split(/\s+/);
+        return parts[0] === numStr || parts.some(p => p === numStr);
+      });
+
+      if (matchingRow) {
+        console.log(`[add_address] Already exists — "${matchingRow}". Stopping.`);
         return {
           error: true,
           already_exists: true,
-          message: `Address already exists in OTM — not added. ${searchResults.length} matching record(s) found: ${searchResults.slice(0, 3).join(' | ')}`,
+          message: `This address already exists in OTM and was not added. Found: "${matchingRow}"`,
         };
       }
 
-      console.log(`[add_address] Not found — navigating to entry form`);
+      console.log(`[add_address] ${searchRows.length} result(s) for street but none matched house number ${street_number} — proceeding to add`);
 
       // ── Step 2: Navigate directly to AdminSingleAddr.php ─────────────────
       await session.navigate(PAGES.addrEntry);
