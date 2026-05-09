@@ -159,34 +159,36 @@ async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, 
     : [{ role: 'system', content: systemPrompt }, ...priorMessages, { role: 'user', content: task }];
   const recentTools = [];
 
-  let geminiRetried = false;
-
-  const geminiRequest = () => client.chat.completions.create({
-    model,
-    max_tokens: 4096,
-    tools: formattedTools,
-    tool_choice: 'auto',
-    messages,
-  });
-
-  try {
-    for (let turn = 0; turn < MAX_TURNS; turn++) {
-      let response;
+  // Retry each API call up to 3 times with exponential backoff (15s → 30s → 60s).
+  const geminiRequest = async () => {
+    const delays = [15000, 30000, 60000];
+    for (let attempt = 0; ; attempt++) {
       try {
-        response = await geminiRequest();
+        return await client.chat.completions.create({
+          model,
+          max_tokens: 4096,
+          tools: formattedTools,
+          tool_choice: 'auto',
+          messages,
+        });
       } catch (e) {
         const status = e?.status ?? e?.response?.status;
         const body   = e?.message || e?.error?.message || '';
         const isRateLimit = status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate');
-        if (isRateLimit && !geminiRetried) {
-          geminiRetried = true;
-          console.warn('[Agent] Gemini 429 — waiting 15s and retrying once...');
-          await new Promise(r => setTimeout(r, 15000));
-          response = await geminiRequest();
+        if (isRateLimit && attempt < delays.length) {
+          const wait = delays[attempt];
+          console.warn(`[Agent] Gemini 429 — waiting ${wait / 1000}s before retry ${attempt + 1}/${delays.length}...`);
+          await new Promise(r => setTimeout(r, wait));
         } else {
           throw e;
         }
       }
+    }
+  };
+
+  try {
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const response = await geminiRequest();
 
       const choice = response.choices?.[0];
       if (!choice) throw new Error('Gemini returned empty choices — likely a quota or auth error');
