@@ -2,12 +2,13 @@ import Anthropic from '@anthropic-ai/sdk';
 import OpenAI from 'openai';
 import Groq from 'groq-sdk';
 
-export const PROVIDERS = ['anthropic', 'openai', 'groq'];
+export const PROVIDERS = ['gemini', 'anthropic', 'openai', 'groq'];
 
 export const DEFAULT_MODELS = {
+  gemini:    'gemini-2.0-flash',
   anthropic: 'claude-sonnet-4-20250514',
-  openai: 'gpt-4o',
-  groq: 'llama-3.3-70b-versatile',
+  openai:    'gpt-4o',
+  groq:      'llama-3.3-70b-versatile',
 };
 
 const MAX_TURNS = 12; // If not done in 12 turns something is wrong.
@@ -98,6 +99,54 @@ async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onTex
         content: resultText,
       })),
     });
+
+    if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
+  }
+}
+
+async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
+  const client = new OpenAI({
+    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
+    apiKey: process.env.GEMINI_API_KEY,
+  });
+  const formattedTools = toOpenAITools(tools);
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...priorMessages,
+    { role: 'user', content: task },
+  ];
+  const recentTools = [];
+
+  for (let turn = 0; turn < MAX_TURNS; turn++) {
+    const response = await client.chat.completions.create({
+      model,
+      max_tokens: 4096,
+      tools: formattedTools,
+      tool_choice: 'auto',
+      messages,
+    });
+
+    const msg = response.choices[0].message;
+
+    if (msg.content) onText?.(msg.content);
+
+    messages.push(msg);
+
+    const toolCalls = msg.tool_calls ?? [];
+
+    if (response.choices[0].finish_reason === 'stop' || toolCalls.length === 0) break;
+
+    const pending = toolCalls.map((tc) => ({
+      id: tc.id,
+      name: tc.function.name,
+      input: JSON.parse(tc.function.arguments || '{}'),
+    }));
+
+    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
+
+    for (const { id, name, resultText } of results) {
+      messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
+    }
 
     if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
   }
@@ -194,47 +243,57 @@ async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, on
 }
 
 /**
- * Run the full agentic loop for a given provider, with optional fallback.
+ * Run the full agentic loop for a given provider, with an optional fallback chain.
  *
- * @param {object} opts
- * @param {string}   opts.task             Plain-English task string.
- * @param {string}   opts.provider         'anthropic' | 'openai' | 'groq'
- * @param {string}  [opts.model]           Model override. Defaults to DEFAULT_MODELS[provider].
- * @param {string}  [opts.fallbackProvider] Provider to use if the primary fails.
- * @param {string}   opts.systemPrompt     System prompt text.
- * @param {Array}    opts.tools            OTM_TOOLS array from mcp-server.js.
- * @param {Function} opts.callTool         async (name, args) => result
- * @param {Function} [opts.onText]         Called with each text chunk from the model.
- * @param {Function} [opts.onToolCall]     Called with (name, input) before execution.
- * @param {Function} [opts.onToolResult]   Called with (name, resultText) after execution.
- * @param {Function} [opts.onFallback]     Called with (fallbackProvider, errorMessage) when falling back.
+ * @param {object}   opts
+ * @param {string}   opts.task              Plain-English task string.
+ * @param {string}   opts.provider          'gemini' | 'anthropic' | 'openai' | 'groq'
+ * @param {string}  [opts.model]            Model override. Defaults to DEFAULT_MODELS[provider].
+ * @param {string[]} [opts.fallbackChain]   Ordered list of providers to try if primary fails.
+ * @param {string}   opts.systemPrompt      System prompt text.
+ * @param {Array}    opts.tools             OTM_TOOLS array from mcp-server.js.
+ * @param {Function} opts.callTool          async (name, args) => result
+ * @param {Function} [opts.onText]          Called with each text chunk from the model.
+ * @param {Function} [opts.onToolCall]      Called with (name, input) before execution.
+ * @param {Function} [opts.onToolResult]    Called with (name, resultText) after execution.
+ * @param {Function} [opts.onFallback]      Called with (provider, errorMessage) when falling back.
  */
 export async function runAgentLoop(opts) {
-  const provider = opts.provider ?? 'anthropic';
-  const model    = opts.model ?? DEFAULT_MODELS[provider];
-  const fallback = opts.fallbackProvider;
+  const primary = opts.provider ?? 'gemini';
+  const model   = opts.model ?? DEFAULT_MODELS[primary];
+  const chain   = opts.fallbackChain ?? [];
 
-  if (!PROVIDERS.includes(provider)) {
-    throw new Error(`Unknown provider "${provider}". Choose from: ${PROVIDERS.join(', ')}`);
+  if (!PROVIDERS.includes(primary)) {
+    throw new Error(`Unknown provider "${primary}". Choose from: ${PROVIDERS.join(', ')}`);
   }
 
   function runWith(p, m) {
     const args = { ...opts, provider: p, model: m };
     switch (p) {
+      case 'gemini':    return geminiLoop(args);
       case 'anthropic': return anthropicLoop(args);
       case 'openai':    return openaiLoop(args);
       case 'groq':      return groqLoop(args);
     }
   }
 
-  try {
-    return await runWith(provider, model);
-  } catch (e) {
-    if (fallback && fallback !== provider) {
-      console.warn(`[Agent] ${provider} failed (${e.message}) — falling back to ${fallback}`);
-      opts.onFallback?.(fallback, e.message);
-      return runWith(fallback, DEFAULT_MODELS[fallback]);
+  const sequence = [
+    { provider: primary, model },
+    ...chain.map((p) => ({ provider: p, model: DEFAULT_MODELS[p] })),
+  ];
+
+  for (let i = 0; i < sequence.length; i++) {
+    const { provider: p, model: m } = sequence[i];
+    try {
+      return await runWith(p, m);
+    } catch (e) {
+      const next = sequence[i + 1];
+      if (next) {
+        console.warn(`[Agent] ${p} failed (${e.message}) — falling back to ${next.provider}`);
+        opts.onFallback?.(next.provider, e.message);
+      } else {
+        throw e;
+      }
     }
-    throw e;
   }
 }

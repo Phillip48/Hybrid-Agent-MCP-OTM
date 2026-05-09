@@ -21,7 +21,7 @@ import session from './browser.js';
 
 function parseArgs(argv) {
   const args = argv.slice(2);
-  let provider = process.env.AI_PROVIDER ?? 'anthropic';
+  let provider = process.env.AI_PROVIDER ?? 'gemini';
   let model;
   const taskParts = [];
 
@@ -49,8 +49,8 @@ Usage:
   node index.js [options] "<task>"
 
 Options:
-  --provider, -p  AI provider to use: anthropic | openai | groq
-                  (default: anthropic, or AI_PROVIDER env var)
+  --provider, -p  AI provider to use: gemini | anthropic | openai | groq
+                  (default: gemini, or AI_PROVIDER env var)
   --model, -m     Override the model (default per provider shown below)
   --help, -h      Show this help
 
@@ -124,7 +124,13 @@ async function main() {
 
   const resolvedModel = model ?? DEFAULT_MODELS[provider];
 
-  console.log(`\n[Agent] Provider : ${provider}`);
+  // Fallback chain: skip the primary provider, always try groq then anthropic.
+  const FALLBACK_ORDER = ['groq', 'anthropic'];
+  const fallbackChain = FALLBACK_ORDER.filter((p) => p !== provider);
+
+  let activeProvider = provider;
+
+  console.log(`\n[Agent] Provider : ${provider} → fallbacks: ${fallbackChain.join(' → ')}`);
   console.log(`[Agent] Model    : ${resolvedModel}`);
   console.log(`[Agent] Task     : ${task}`);
   console.log('─'.repeat(60));
@@ -134,14 +140,19 @@ async function main() {
       task,
       provider,
       model: resolvedModel,
+      fallbackChain,
       systemPrompt: SYSTEM_PROMPT,
       tools: OTM_TOOLS,
       callTool,
-      onText: (text) => console.log(`\n[${provider}] ${text}`),
+      onText: (text) => console.log(`\n[${activeProvider}] ${text}`),
       onToolCall: (name, input) =>
         console.log(`\n[Tool] → ${name}`, JSON.stringify(input, null, 2)),
       onToolResult: (name, result) =>
         console.log(`[Tool] ← ${name}:`, result.slice(0, 500), result.length > 500 ? '...' : ''),
+      onFallback: (next, reason) => {
+        activeProvider = next;
+        console.log(`\n[Agent] Switching to ${next} (reason: ${reason})`);
+      },
     });
 
     console.log('\n[Agent] Task complete.');
