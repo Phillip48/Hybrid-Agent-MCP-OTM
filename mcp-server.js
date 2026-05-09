@@ -1121,12 +1121,17 @@ export function createCallTool(session) {
     return withBrowser(async () => {
       const numStr      = String(street_number).trim();
       const fullAddress = `${numStr} ${street_name}${unit ? ` ${unit}` : ''}${city ? `, ${city}` : ''}${zip ? ` ${zip}` : ''}`.trim();
-      console.log(`[add_address] Step 1 — searching for "${fullAddress}"`);
+      console.log(`[add_address] Step 1 — searching for "${numStr} ${street_name}"`);
 
-      // ── Step 1: Search by house number + street name ─────────────────────
+      // ── Step 1: Search by house number + street name only ────────────────
       await session.navigate(PAGES.addrSearch);
 
-      // AddrSearch.php uses 'housenum'/'street' (lowercase) — try both conventions.
+      // Clear all text inputs so prior session values don't leak into the search.
+      await session.evaluate(() => {
+        document.querySelectorAll('input[type="text"], input:not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]):not([type="hidden"])').forEach(el => { el.value = ''; });
+      });
+
+      // Fill only house number and street name — nothing else.
       for (const sel of ['input[name="housenum"]', 'input[name="Addr"]']) {
         try { await session.fill(sel, numStr); break; } catch {}
       }
@@ -1136,8 +1141,8 @@ export function createCallTool(session) {
 
       // Register the wait BEFORE clicking so we don't miss the navigation event.
       await Promise.all([
-        session.page.waitForLoadState('networkidle').catch(() =>
-          session.page.waitForLoadState('domcontentloaded').catch(() => {})
+        session.page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() =>
+          session.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
         ),
         session.page.click('input[type="submit"], button[type="submit"]').catch(() =>
           session.evaluate(() => {
@@ -1170,7 +1175,7 @@ export function createCallTool(session) {
       // ── Step 2: Fill the add form and save ───────────────────────────────
       console.log(`[add_address] Step 2 — navigating to add form`);
       await session.navigate(PAGES.addrEntry);
-      await session.page.waitForLoadState('domcontentloaded');
+      await session.page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
 
       await session.fill('input[name="Addr"]',   numStr);
       await session.fill('input[name="Street"]', street_name);
@@ -1191,13 +1196,15 @@ export function createCallTool(session) {
         await session.page.click('input[type="button"][value="Get Lat/Long"]');
         await session.page.waitForFunction(
           () => { const el = document.getElementById('Lat'); return el && el.value && el.value !== ''; },
-          { timeout: 10000 }
+          { timeout: 8000 }
         ).catch(() => {});
       } catch {}
 
       // Save.
       await session.page.click('input[name="save"]');
-      await session.page.waitForLoadState('networkidle').catch(() => {});
+      await session.page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() =>
+        session.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
+      );
 
       const resultText = await session.evaluate(() => document.body.innerText);
       const success    = /success|saved|added|record/i.test(resultText);
