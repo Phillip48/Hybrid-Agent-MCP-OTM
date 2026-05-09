@@ -1,6 +1,6 @@
 # Hybrid Browser-Agent / MCP Server for OTM
 
-Automates [Online Territory Manager](https://onlineterritorymanager.com) using Playwright browser automation driven by an AI agent loop. Supports **Anthropic (Claude)**, **OpenAI (GPT-4o)**, and **Groq (Llama)** as interchangeable providers, with **automatic Groq-first fallback** to keep costs low. Also exposes the same OTM actions as an MCP Server for Claude Desktop.
+Automates [Online Territory Manager](https://onlineterritorymanager.com) using Playwright browser automation driven by an AI agent loop. Supports **Gemini**, **Groq (Llama)**, **Anthropic (Claude)**, and **OpenAI (GPT-4o)** as interchangeable providers, with an automatic **Gemini → Groq → Anthropic** free-first fallback chain to keep costs low. Also exposes the same OTM actions as an MCP Server for Claude Desktop.
 
 ## How it's currently used
 
@@ -29,8 +29,15 @@ Admins can also restart the bot directly from Telegram with `/restart` without n
 
 ```
 ┌──────────────────────────────────────────────────────┐
+│  bot.js  — Telegram bot (24/7, managed by PM2)       │
+│  • User allow-list, /setup, /restart, /debug         │
+│  • Queues tasks and dispatches to providers.js       │
+│  • 75s timeout (240s for routing tasks)              │
+└──────────────────┬───────────────────────────────────┘
+                   │
+┌──────────────────▼───────────────────────────────────┐
 │  index.js  — CLI entry point                         │
-│  • --provider anthropic | openai | groq              │
+│  • --provider gemini | anthropic | openai | groq     │
 │  • --model <override>                                │
 │  • Reads task from args / stdin / prompt             │
 │  • Dispatches tool calls → mcp-server.js             │
@@ -38,22 +45,23 @@ Admins can also restart the bot directly from Telegram with `/restart` without n
                    │
 ┌──────────────────▼───────────────────────────────────┐
 │  providers.js  — Unified AI provider abstraction     │
-│  • groqLoop       (tried first — free tier)          │
-│  • anthropicLoop  (fallback if Groq fails)           │
-│  • openaiLoop     (fallback if Groq fails)           │
+│  • geminiLoop     (tried first — free tier)          │
+│  • groqLoop       (free fallback)                    │
+│  • anthropicLoop  (last-resort fallback)             │
+│  • openaiLoop     (alternative last-resort)          │
 │  Normalizes tool formats and message history for     │
-│  each provider's API. Automatic provider fallback.   │
+│  each provider's API. Carries conversation history   │
+│  across fallbacks so context is never lost.          │
 └──────────────────┬───────────────────────────────────┘
                    │
 ┌──────────────────▼───────────────────────────────────┐
 │  mcp-server.js  — OTM tool implementations           │
-│  • list_territories   • assign_territory             │
-│  • get_territory      • return_territory             │
-│  • search_territories • list_publishers              │
-│  • get_territory_status • route_territory            │
-│  • navigate_page      • get_page_content             │
-│  • click_element      • fill_form                    │
-│  • take_screenshot                                   │
+│  • list_territories   • checkout_territory           │
+│  • search_territories • return_territory             │
+│  • get_territory_status • list_publishers            │
+│  • search_addresses   • add_address                  │
+│  • find_duplicate_addresses • route_territory        │
+│  • report_* (8 reports)  • take_screenshot           │
 │  Also runs standalone as an MCP Server (stdio)       │
 └──────────────────┬───────────────────────────────────┘
                    │
@@ -71,7 +79,7 @@ Admins can also restart the bot directly from Telegram with `/restart` without n
 Every task runs through a three-tier free-first chain. Gemini and Groq are both free-tier; Anthropic is only reached if both fail.
 
 ```
-Every task → Gemini (gemini-2.0-flash)        ← free, tried first
+Every task → Gemini (gemini-2.0-flash-lite)    ← free, tried first
                 │
                 ├─ success → done
                 └─ failure → Groq (llama-3.3-70b-versatile)  ← free fallback
@@ -106,19 +114,22 @@ Edit `.env`:
 ```env
 OTM_USER=your_email@example.com
 OTM_PASS=your_password
-HEADLESS=true                  # set to false to watch the browser
+HEADLESS=true                    # set to false to watch the browser
 
-AI_PROVIDER=anthropic          # last-resort fallback (gemini → groq → this)
+AI_PROVIDER=anthropic            # last-resort fallback (gemini → groq → this)
 
-GEMINI_API_KEY=AIza...         # required — free at aistudio.google.com
-GROQ_API_KEY=gsk_...           # required — free at console.groq.com
-ANTHROPIC_API_KEY=sk-ant-...   # last-resort fallback key
-OPENAI_API_KEY=sk-...          # alternative last-resort
+GEMINI_API_KEY=AIza...           # required — free at aistudio.google.com
+GROQ_API_KEY=gsk_...             # required — free at console.groq.com
+ANTHROPIC_API_KEY=sk-ant-...     # last-resort fallback key
+OPENAI_API_KEY=sk-...            # alternative last-resort
 
-GEO_KEY=your_geocodio_api_key  # required for route_territory
+GEO_KEY=your_geocodio_api_key    # required for route_territory
+
+TELEGRAM_BOT_TOKEN=...           # required for bot.js
+TELEGRAM_ADMIN_IDS=123456,789012 # comma-separated admin Telegram user IDs
 ```
 
-You need `GROQ_API_KEY` for all tasks. Add a fallback provider key (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) for reliability on complex tasks.
+You need `GEMINI_API_KEY` and `GROQ_API_KEY` for the free-first chain. Add a fallback provider key (`ANTHROPIC_API_KEY` or `OPENAI_API_KEY`) for reliability when both free tiers are rate-limited.
 
 ## Usage
 
@@ -144,7 +155,7 @@ node index.js -p anthropic "Assign territory 42 to Jane Smith"
 
 | Provider | Default model | Notes |
 |----------|--------------|-------|
-| `gemini` | `gemini-2.0-flash` | Always tried first — free tier |
+| `gemini` | `gemini-2.0-flash-lite` | Always tried first — free tier (30 RPM) |
 | `groq` | `llama-3.3-70b-versatile` | Second attempt — free tier |
 | `anthropic` | `claude-haiku-4-5-20251001` | Last-resort fallback — cheapest Claude with tool use |
 | `openai` | `gpt-4o-mini` | Alternative last-resort — ~15x cheaper than gpt-4o |
@@ -217,18 +228,36 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | Tool | Description |
 |------|-------------|
 | `list_territories` | Lists all territories with status; optional `status_filter` |
-| `get_territory` | Full details for a territory by number |
-| `search_territories` | Search by number, name, or city |
-| `get_territory_status` | Current checkout status of a territory |
-| `assign_territory` | Check out a territory to a publisher |
+| `search_territories` | Search by number, name, or keyword |
+| `load_territory` | Loads a territory into the panel (required before checkout/return) |
+| `checkout_territory` | Full checkout flow — loads territory, selects publisher, sets date |
 | `return_territory` | Mark a territory as returned |
-| `list_publishers` | List congregation publishers; optional `group_filter` |
-| `get_publisher` | Details and territory history for a publisher |
-| `route_territory` | Routes a territory's addresses in optimal driving order from home base using Geocodio + nearest-neighbor |
+| `get_territory_status` | Whether a territory is checked out and by whom |
+| `list_checked_out` | All currently checked-out territories with publisher and date |
+| `list_publishers` | List congregation publishers; optional name filter |
+| `get_panel` | Returns current right-panel content |
+| `click_panel_button` | Clicks a button inside the panel by visible text |
+| `search_addresses` | Search OTM addresses by house number, street, city, or zip |
+| `add_address` | Add a new address to OTM (checks for duplicates first) |
+| `find_duplicate_addresses` | Runs the built-in duplicate address checker |
+| `route_territory` | Routes a territory's addresses in optimal driving order using Geocodio |
+| `report_worked_log` | Territory worked log — last worked and check-in/out history |
+| `report_territory_list` | Full territory list with addresses and status |
+| `report_checkinout` | S-13 style check-in/out assignment history report |
+| `report_group_stats` | Territory coverage stats per service group |
+| `report_stats_by_grouping` | Territory statistics by grouping/type |
+| `report_address_demographics` | Address type breakdown across territories |
+| `report_territory_export` | Exportable territory list with full details |
+| `report_letter_writing` | Letter writing activity statistics |
+| `report_address_export` | Full address list with return visit notes |
+| `list_territory_groups` | All territory groups/service groups |
+| `list_territory_types` | All territory types defined in OTM |
+| `list_campaigns` | Active campaigns |
+| `list_announcements` | Congregation announcements |
+| `get_congregation_options` | Congregation-level settings and options |
+| `get_user_preferences` | Current user preferences |
 | `navigate_page` | Navigate to any OTM path or URL |
 | `get_page_content` | Get visible text of the current page |
-| `click_element` | Click an element by CSS selector or `text=...` |
-| `fill_form` | Fill an input field |
 | `take_screenshot` | Returns base64 PNG of the current page |
 
 ---
@@ -237,7 +266,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 1. **On first run** the agent logs in with your OTM credentials and saves the session cookies to `cookies.json`.
 2. **On subsequent runs** the saved cookies are loaded — login is skipped unless the session has expired.
-3. **The agentic loop** sends your task to Gemini first (free). If Gemini fails, it retries with Groq (also free). If Groq fails, it falls back to your configured last-resort provider (Anthropic by default).
+3. **The agentic loop** sends your task to Gemini first (free). On a 429 rate-limit error it retries twice (8s then 20s) before giving up. If Gemini fails, it tries Groq (also free), then falls back to your configured last-resort provider (Anthropic by default). Conversation history is carried across fallbacks so context is never lost.
 4. **Tool format normalization** — `providers.js` converts the OTM tool definitions to each provider's format (Anthropic `input_schema` vs OpenAI/Groq `parameters`) and translates their different message history structures transparently.
 5. **Errors are surfaced gracefully** — Playwright failures are returned as tool results so the model can retry with a different approach.
 
@@ -259,8 +288,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 ## File reference
 
 ```
+├── bot.js                Telegram bot — user management, task dispatch, PM2 entry point
 ├── index.js              CLI entry point — parses --provider / --model flags
-├── providers.js          Unified AI provider abstraction (Groq-first + fallback)
+├── providers.js          Unified AI provider abstraction (Gemini-first + fallback chain)
 ├── mcp-server.js         OTM tool implementations + MCP Server (stdio)
 ├── browser.js            Playwright session manager
 ├── .env                  Credentials and API keys (never commit this)

@@ -12,12 +12,14 @@ carry them out.
 
 | File | Role |
 |------|------|
+| `bot.js` | Telegram bot — user allow-list, `/setup`, `/restart`, task dispatch, PM2 entry point |
 | `browser.js` | Singleton `BrowserSession` — all Playwright interactions live here |
 | `mcp-server.js` | OTM tool implementations + MCP Server wiring (stdio) |
-| `providers.js` | Unified AI provider abstraction (Anthropic, OpenAI, Groq) |
+| `providers.js` | Unified AI provider abstraction (Gemini → Groq → Anthropic/OpenAI fallback chain) |
 | `index.js` | CLI entry point; parses `--provider` / `--model`; runs agentic loop |
-| `.env` | `OTM_USER`, `OTM_PASS`, `AI_PROVIDER`, all three API keys, `HEADLESS` |
+| `.env` | `OTM_USER`, `OTM_PASS`, `AI_PROVIDER`, all API keys, `HEADLESS`, Telegram tokens |
 | `cookies.json` | Auto-generated saved Playwright session (gitignored) |
+| `geocode-cache.json` | Persistent address → coordinates cache for `route_territory` (gitignored) |
 
 ## Architecture rules
 
@@ -79,10 +81,14 @@ If a Playwright selector stops working:
 | `HEADLESS` | `true` | Set to `false` to show the browser window |
 | `OTM_USER` | — | OTM login email |
 | `OTM_PASS` | — | OTM login password |
-| `AI_PROVIDER` | `anthropic` | Default provider (`anthropic` \| `openai` \| `groq`) |
-| `ANTHROPIC_API_KEY` | — | Required when provider is `anthropic` |
-| `OPENAI_API_KEY` | — | Required when provider is `openai` |
-| `GROQ_API_KEY` | — | Required when provider is `groq` |
+| `AI_PROVIDER` | `gemini` | Primary provider; fallback chain is `gemini → groq → this` |
+| `GEMINI_API_KEY` | — | Required — free at [aistudio.google.com](https://aistudio.google.com) |
+| `GROQ_API_KEY` | — | Required — free at [console.groq.com](https://console.groq.com) |
+| `ANTHROPIC_API_KEY` | — | Last-resort fallback key |
+| `OPENAI_API_KEY` | — | Alternative last-resort key |
+| `GEO_KEY` | — | Geocodio API key — required for `route_territory` |
+| `TELEGRAM_BOT_TOKEN` | — | Required for `bot.js` |
+| `TELEGRAM_ADMIN_IDS` | — | Comma-separated admin Telegram user IDs |
 
 ## Running locally
 
