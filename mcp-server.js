@@ -194,7 +194,6 @@ export const OTM_TOOLS = [
         street:   { type: 'string', description: 'Street name only (e.g. "Main St"). Do NOT include the house number here.' },
         city:     { type: 'string', description: 'City to filter by.' },
         zip:      { type: 'string', description: 'Zip code to filter by.' },
-        name:     { type: 'string', description: 'Householder name to search for.' },
       },
     },
   },
@@ -743,37 +742,45 @@ export function createCallTool(session) {
 
   // ── Address tool handlers ───────────────────────────────────────────────────
 
-  async function handleSearchAddresses({ housenum, street, city, zip, name } = {}) {
+  async function handleSearchAddresses({ housenum, street, city, zip } = {}) {
     return withBrowser(async () => {
       await session.navigate(PAGES.addrSearch);
 
-      // Fill whichever search fields were provided.
-      const fieldMap = [
-        ['input[name="housenum"]',                                   housenum],
-        ['input[name="street"]',                                     street],
-        ['input[name*="city"   i], input[placeholder*="city"   i]', city],
-        ['input[name*="zip"    i], input[placeholder*="zip"    i]', zip],
-        ['input[name*="name"   i], input[placeholder*="name"   i]', name],
-      ];
-      for (const [sel, val] of fieldMap) {
-        if (!val) continue;
-        try { await session.fill(sel, val); } catch {}
-      }
+      // Clear all text inputs and reset selects so prior session values don't leak.
+      // The Lang select defaults to "Portuguese" which would restrict results silently.
+      await session.evaluate(() => {
+        document.querySelectorAll('input[type="text"], input:not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"]):not([type="hidden"])').forEach(el => { el.value = ''; });
+        const lang = document.querySelector('select[name="Lang"]');
+        if (lang) lang.value = 'ALLLANG';
+        const busRes = document.querySelector('select[name="BusRes"]');
+        if (busRes) busRes.value = '';
+        const ternum = document.querySelector('select[name="ternum"]');
+        if (ternum) ternum.value = '';
+      });
 
-      // Submit the search form.
-      try {
-        await session.evaluate(() => {
-          const btn = document.querySelector('input[type="submit"], button[type="submit"]');
-          if (btn) btn.click();
-        });
-        await session.page.waitForLoadState('domcontentloaded');
-      } catch {}
+      // Fill only the fields that were provided.
+      if (housenum) try { await session.fill('input[name="housenum"]', String(housenum)); } catch {}
+      if (street)   try { await session.fill('input[name="street"]',   String(street));   } catch {}
+      if (city)     try { await session.fill('input[name="city"]',     String(city));     } catch {}
+      if (zip)      try { await session.fill('input[name="zip"]',      String(zip));      } catch {}
+
+      // Submit and wait for the results page.
+      await Promise.all([
+        session.page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() =>
+          session.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {})
+        ),
+        session.page.click('input[name="Search"]').catch(() =>
+          session.evaluate(() => {
+            const btn = document.querySelector('input[name="Search"], input[type="submit"]');
+            if (btn) btn.click();
+          }).catch(() => {})
+        ),
+      ]);
 
       const table = await session.scrapeTable('table');
-      const text  = await session.evaluate(() => document.body.innerText);
       return table?.rows?.length
         ? { headers: table.headers, addresses: table.rows, count: table.rows.length }
-        : { raw: text.slice(0, 4000) };
+        : { addresses: [], count: 0, message: 'No matching addresses found.' };
     });
   }
 
