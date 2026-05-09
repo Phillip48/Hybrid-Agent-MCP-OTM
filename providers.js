@@ -36,6 +36,48 @@ function toOpenAITools(tools) {
 
 // Helpers
 
+/**
+ * Convert OpenAI-format message history to Anthropic format.
+ * Used when falling back from Gemini/Groq to Anthropic so the conversation
+ * context carries over rather than starting from scratch.
+ */
+function openAIHistoryToAnthropic(history) {
+  const result = [];
+  let i = 0;
+  while (i < history.length) {
+    const msg = history[i];
+    if (msg.role === 'user') {
+      result.push({ role: 'user', content: msg.content });
+      i++;
+    } else if (msg.role === 'assistant') {
+      const content = [];
+      if (msg.content) content.push({ type: 'text', text: msg.content });
+      for (const tc of (msg.tool_calls ?? [])) {
+        let input = {};
+        try { input = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+        content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
+      }
+      if (content.length === 0) content.push({ type: 'text', text: '' });
+      result.push({ role: 'assistant', content });
+      i++;
+      // Collect consecutive tool results into one user message (Anthropic requires this).
+      const toolResults = [];
+      while (i < history.length && history[i].role === 'tool') {
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: history[i].tool_call_id,
+          content: history[i].content,
+        });
+        i++;
+      }
+      if (toolResults.length) result.push({ role: 'user', content: toolResults });
+    } else {
+      i++;
+    }
+  }
+  return result;
+}
+
 function truncate(text, max = 8000) {
   return text.length > max ? text.slice(0, max) + '\n... [truncated]' : text;
 }
@@ -63,10 +105,11 @@ async function executeToolCalls(toolCalls, callTool, onToolCall, onToolResult, r
   );
 }
 
-async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
+async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [], priorHistory = null }) {
   const client = new Anthropic();
   const formattedTools = toAnthropicTools(tools);
-  const messages = [...priorMessages, { role: 'user', content: task }];
+  // priorHistory is in Anthropic format when resuming after a fallback from Gemini/Groq.
+  const messages = priorHistory ? [...priorHistory] : [...priorMessages, { role: 'user', content: task }];
   const recentTools = [];
 
   for (let turn = 0; turn < MAX_TURNS; turn++) {
@@ -104,17 +147,16 @@ async function anthropicLoop({ task, model, systemPrompt, tools, callTool, onTex
   }
 }
 
-async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
+async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [], priorHistory = null }) {
   const client = new OpenAI({
     baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
     apiKey: process.env.GEMINI_API_KEY,
   });
   const formattedTools = toOpenAITools(tools);
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...priorMessages,
-    { role: 'user', content: task },
-  ];
+  // priorHistory (OpenAI format, no system msg) is set when resuming after a fallback.
+  const messages = priorHistory
+    ? [{ role: 'system', content: systemPrompt }, ...priorHistory]
+    : [{ role: 'system', content: systemPrompt }, ...priorMessages, { role: 'user', content: task }];
   const recentTools = [];
 
   try {
@@ -153,103 +195,117 @@ async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, 
       if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
     }
   } catch (e) {
-    // Normalize Gemini errors so the fallback chain always sees a proper Error with a clear message.
     const status  = e?.status ?? e?.response?.status;
     const body    = e?.message || e?.error?.message || '';
-    if (status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate')) {
-      throw new Error(`Gemini rate limit (429) — falling back`);
-    }
-    throw new Error(`Gemini error${status ? ` (${status})` : ''}: ${body || 'no details'}`);
+    const isRateLimit = status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate');
+    const err = new Error(isRateLimit
+      ? `Gemini rate limit (429) — falling back`
+      : `Gemini error${status ? ` (${status})` : ''}: ${body || 'no details'}`);
+    // Carry the conversation history forward so the next provider picks up where this one left off.
+    err.openAIHistory = messages.filter(m => m.role !== 'system');
+    throw err;
   }
 }
 
-async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
+async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [], priorHistory = null }) {
   const client = new OpenAI();
   const formattedTools = toOpenAITools(tools);
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...priorMessages,
-    { role: 'user', content: task },
-  ];
+  const messages = priorHistory
+    ? [{ role: 'system', content: systemPrompt }, ...priorHistory]
+    : [{ role: 'system', content: systemPrompt }, ...priorMessages, { role: 'user', content: task }];
   const recentTools = [];
 
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
-    const response = await client.chat.completions.create({
-      model,
-      max_tokens: 4096,
-      tools: formattedTools,
-      tool_choice: 'auto',
-      messages,
-    });
+  try {
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const response = await client.chat.completions.create({
+        model,
+        max_tokens: 4096,
+        tools: formattedTools,
+        tool_choice: 'auto',
+        messages,
+      });
 
-    const msg = response.choices[0].message;
+      const msg = response.choices[0].message;
 
-    if (msg.content) onText?.(msg.content);
+      if (msg.content) onText?.(msg.content);
 
-    messages.push(msg);
+      messages.push(msg);
 
-    const toolCalls = msg.tool_calls ?? [];
+      const toolCalls = msg.tool_calls ?? [];
 
-    if (response.choices[0].finish_reason === 'stop' || toolCalls.length === 0) break;
+      if (response.choices[0].finish_reason === 'stop' || toolCalls.length === 0) break;
 
-    const pending = toolCalls.map((tc) => ({
-      id: tc.id,
-      name: tc.function.name,
-      input: JSON.parse(tc.function.arguments || '{}'),
-    }));
+      const pending = toolCalls.map((tc) => ({
+        id: tc.id,
+        name: tc.function.name,
+        input: JSON.parse(tc.function.arguments || '{}'),
+      }));
 
-    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
+      const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
 
-    for (const { id, name, resultText } of results) {
-      messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
+      for (const { id, name, resultText } of results) {
+        messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
+      }
+
+      if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
     }
-
-    if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
+  } catch (e) {
+    const err = new Error(`OpenAI error: ${e?.message || 'no details'}`);
+    err.openAIHistory = messages.filter(m => m.role !== 'system');
+    throw err;
   }
 }
 
-async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [] }) {
+async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, onToolCall, onToolResult, priorMessages = [], priorHistory = null }) {
   const client = new Groq();
   const formattedTools = toOpenAITools(tools);
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    ...priorMessages,
-    { role: 'user', content: task },
-  ];
+  const messages = priorHistory
+    ? [{ role: 'system', content: systemPrompt }, ...priorHistory]
+    : [{ role: 'system', content: systemPrompt }, ...priorMessages, { role: 'user', content: task }];
   const recentTools = [];
 
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
-    const response = await client.chat.completions.create({
-      model,
-      max_tokens: 4096,
-      tools: formattedTools,
-      tool_choice: 'auto',
-      messages,
-    });
+  try {
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const response = await client.chat.completions.create({
+        model,
+        max_tokens: 4096,
+        tools: formattedTools,
+        tool_choice: 'auto',
+        messages,
+      });
 
-    const msg = response.choices[0].message;
+      const msg = response.choices[0].message;
 
-    if (msg.content) onText?.(msg.content);
+      if (msg.content) onText?.(msg.content);
 
-    messages.push(msg);
+      messages.push(msg);
 
-    const toolCalls = msg.tool_calls ?? [];
+      const toolCalls = msg.tool_calls ?? [];
 
-    if (response.choices[0].finish_reason === 'stop' || toolCalls.length === 0) break;
+      if (response.choices[0].finish_reason === 'stop' || toolCalls.length === 0) break;
 
-    const pending = toolCalls.map((tc) => ({
-      id: tc.id,
-      name: tc.function.name,
-      input: JSON.parse(tc.function.arguments || '{}'),
-    }));
+      const pending = toolCalls.map((tc) => ({
+        id: tc.id,
+        name: tc.function.name,
+        input: JSON.parse(tc.function.arguments || '{}'),
+      }));
 
-    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
+      const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
 
-    for (const { id, name, resultText } of results) {
-      messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
+      for (const { id, name, resultText } of results) {
+        messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
+      }
+
+      if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
     }
-
-    if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
+  } catch (e) {
+    const status = e?.status ?? e?.response?.status;
+    const isRateLimit = status === 429 || (e?.message || '').toLowerCase().includes('rate');
+    const err = new Error(isRateLimit
+      ? `Groq rate limit (429) — falling back`
+      : `Groq error${status ? ` (${status})` : ''}: ${e?.message || 'no details'}`);
+    err.openAIHistory = messages.filter(m => m.role !== 'system');
+    throw err;
   }
 }
 
@@ -278,8 +334,10 @@ export async function runAgentLoop(opts) {
     throw new Error(`Unknown provider "${primary}". Choose from: ${PROVIDERS.join(', ')}`);
   }
 
-  function runWith(p, m) {
-    const args = { ...opts, provider: p, model: m };
+  const OPENAI_COMPAT = new Set(['gemini', 'groq', 'openai']);
+
+  function runWith(p, m, extra = {}) {
+    const args = { ...opts, ...extra, provider: p, model: m };
     switch (p) {
       case 'gemini':    return geminiLoop(args);
       case 'anthropic': return anthropicLoop(args);
@@ -293,11 +351,22 @@ export async function runAgentLoop(opts) {
     ...chain.map((p) => ({ provider: p, model: DEFAULT_MODELS[p] })),
   ];
 
+  // OpenAI-format history accumulated by the last failed provider.
+  let savedHistory = null;
+
   for (let i = 0; i < sequence.length; i++) {
     const { provider: p, model: m } = sequence[i];
     try {
-      return await runWith(p, m);
+      const extra = {};
+      if (savedHistory) {
+        // Pass history in the format the next provider expects.
+        extra.priorHistory = OPENAI_COMPAT.has(p)
+          ? savedHistory
+          : openAIHistoryToAnthropic(savedHistory);
+      }
+      return await runWith(p, m, extra);
     } catch (e) {
+      if (e.openAIHistory) savedHistory = e.openAIHistory;
       const next = sequence[i + 1];
       if (next) {
         console.warn(`[Agent] ${p} failed (${e.message}) — falling back to ${next.provider}`);

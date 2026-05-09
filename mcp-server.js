@@ -1134,13 +1134,18 @@ export function createCallTool(session) {
         try { await session.fill(sel, street_name); break; } catch {}
       }
 
-      await session.evaluate(() => {
-        const btn = document.querySelector('input[type="submit"], button[type="submit"]');
-        if (btn) btn.click();
-      });
-      await session.page.waitForLoadState('networkidle').catch(() =>
-        session.page.waitForLoadState('domcontentloaded').catch(() => {})
-      );
+      // Register the wait BEFORE clicking so we don't miss the navigation event.
+      await Promise.all([
+        session.page.waitForLoadState('networkidle').catch(() =>
+          session.page.waitForLoadState('domcontentloaded').catch(() => {})
+        ),
+        session.page.click('input[type="submit"], button[type="submit"]').catch(() =>
+          session.evaluate(() => {
+            const btn = document.querySelector('input[type="submit"], button[type="submit"]');
+            if (btn) btn.click();
+          }).catch(() => {})
+        ),
+      ]);
 
       // Use scrapeTable (same robust logic as search_addresses tool).
       const table = await session.scrapeTable('table');
