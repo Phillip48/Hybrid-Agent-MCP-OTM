@@ -186,14 +186,15 @@ export const OTM_TOOLS = [
   // ── Address Tools ──────────────────────────────────────────────────────────
   {
     name: 'search_addresses',
-    description: 'Search for addresses in the OTM database by street, city, zip, or name. Returns matching address records.',
+    description: 'Search for addresses in the OTM database. Use housenum for the house/building number only, street for the street name only (never combine them). Returns matching address records.',
     inputSchema: {
       type: 'object',
       properties: {
-        street:  { type: 'string', description: 'Street name or number to search for.' },
-        city:    { type: 'string', description: 'City to filter by.' },
-        zip:     { type: 'string', description: 'Zip code to filter by.' },
-        name:    { type: 'string', description: 'Householder name to search for.' },
+        housenum: { type: 'string', description: 'House or building number only (e.g. "232"). Goes in the "Addr # Only" field. Do NOT include the street name here.' },
+        street:   { type: 'string', description: 'Street name only (e.g. "Main St"). Do NOT include the house number here.' },
+        city:     { type: 'string', description: 'City to filter by.' },
+        zip:      { type: 'string', description: 'Zip code to filter by.' },
+        name:     { type: 'string', description: 'Householder name to search for.' },
       },
     },
   },
@@ -742,13 +743,14 @@ export function createCallTool(session) {
 
   // ── Address tool handlers ───────────────────────────────────────────────────
 
-  async function handleSearchAddresses({ street, city, zip, name } = {}) {
+  async function handleSearchAddresses({ housenum, street, city, zip, name } = {}) {
     return withBrowser(async () => {
       await session.navigate(PAGES.addrSearch);
 
       // Fill whichever search fields were provided.
       const fieldMap = [
-        ['input[name*="street" i], input[placeholder*="street" i]', street],
+        ['input[name="housenum"]',                                   housenum],
+        ['input[name="street"]',                                     street],
         ['input[name*="city"   i], input[placeholder*="city"   i]', city],
         ['input[name*="zip"    i], input[placeholder*="zip"    i]', zip],
         ['input[name*="name"   i], input[placeholder*="name"   i]', name],
