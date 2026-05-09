@@ -2,7 +2,7 @@
  * sessions.js — Per-user browser session pool
  *
  * Each Telegram user gets their own BrowserSession instance with their own
- * OTM credentials and their own cookies file (cookies/<userId>.json).
+ * OTM credentials and their own cookies file.
  */
 
 import { BrowserSession } from './browser.js';
