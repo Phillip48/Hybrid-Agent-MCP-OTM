@@ -5,10 +5,10 @@ import Groq from 'groq-sdk';
 export const PROVIDERS = ['gemini', 'anthropic', 'openai', 'groq'];
 
 export const DEFAULT_MODELS = {
-  gemini:    'gemini-2.0-flash',
-  anthropic: 'claude-sonnet-4-20250514',
-  openai:    'gpt-4o',
-  groq:      'llama-3.3-70b-versatile',
+  gemini:    'gemini-2.0-flash',        // free tier, already the lightweight model
+  anthropic: 'claude-haiku-4-5-20251001', // Haiku 4.5 — cheapest Claude with tool use
+  openai:    'gpt-4o-mini',             // ~15x cheaper than gpt-4o, reliable tool use
+  groq:      'llama-3.3-70b-versatile', // free; smaller models are unreliable for tool use
 };
 
 const MAX_TURNS = 12; // If not done in 12 turns something is wrong.

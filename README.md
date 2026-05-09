@@ -146,8 +146,8 @@ node index.js -p anthropic "Assign territory 42 to Jane Smith"
 |----------|--------------|-------|
 | `gemini` | `gemini-2.0-flash` | Always tried first — free tier |
 | `groq` | `llama-3.3-70b-versatile` | Second attempt — free tier |
-| `anthropic` | `claude-sonnet-4-20250514` | Last-resort fallback — best for complex tasks |
-| `openai` | `gpt-4o` | Alternative last-resort — strong tool use |
+| `anthropic` | `claude-haiku-4-5-20251001` | Last-resort fallback — cheapest Claude with tool use |
+| `openai` | `gpt-4o-mini` | Alternative last-resort — ~15x cheaper than gpt-4o |
 
 ### Example tasks
 
