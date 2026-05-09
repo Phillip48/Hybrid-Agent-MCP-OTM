@@ -266,6 +266,7 @@ async function runTask(ctx, userId, task) {
     return;
   }
 
+  console.log('─'.repeat(60));
   log(userId, `Task received: "${task}"`);
 
   const history  = getHistory(userId);
