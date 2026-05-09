@@ -117,38 +117,49 @@ async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, 
   ];
   const recentTools = [];
 
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
-    const response = await client.chat.completions.create({
-      model,
-      max_tokens: 4096,
-      tools: formattedTools,
-      tool_choice: 'auto',
-      messages,
-    });
+  try {
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      const response = await client.chat.completions.create({
+        model,
+        max_tokens: 4096,
+        tools: formattedTools,
+        tool_choice: 'auto',
+        messages,
+      });
 
-    const msg = response.choices[0].message;
+      const choice = response.choices?.[0];
+      if (!choice) throw new Error('Gemini returned empty choices — likely a quota or auth error');
 
-    if (msg.content) onText?.(msg.content);
+      const msg = choice.message;
+      if (msg.content) onText?.(msg.content);
 
-    messages.push(msg);
+      messages.push(msg);
 
-    const toolCalls = msg.tool_calls ?? [];
+      const toolCalls = msg.tool_calls ?? [];
+      if (choice.finish_reason === 'stop' || toolCalls.length === 0) break;
 
-    if (response.choices[0].finish_reason === 'stop' || toolCalls.length === 0) break;
+      const pending = toolCalls.map((tc) => ({
+        id: tc.id,
+        name: tc.function.name,
+        input: JSON.parse(tc.function.arguments || '{}'),
+      }));
 
-    const pending = toolCalls.map((tc) => ({
-      id: tc.id,
-      name: tc.function.name,
-      input: JSON.parse(tc.function.arguments || '{}'),
-    }));
+      const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
 
-    const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
+      for (const { id, name, resultText } of results) {
+        messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
+      }
 
-    for (const { id, name, resultText } of results) {
-      messages.push({ role: 'tool', tool_call_id: id, name, content: resultText });
+      if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
     }
-
-    if (turn === MAX_TURNS - 1) console.warn('[Agent] Warning: reached maximum turn limit.');
+  } catch (e) {
+    // Normalize Gemini errors so the fallback chain always sees a proper Error with a clear message.
+    const status  = e?.status ?? e?.response?.status;
+    const body    = e?.message || e?.error?.message || '';
+    if (status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate')) {
+      throw new Error(`Gemini rate limit (429) — falling back`);
+    }
+    throw new Error(`Gemini error${status ? ` (${status})` : ''}: ${body || 'no details'}`);
   }
 }
 
