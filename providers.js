@@ -5,7 +5,7 @@ import Groq from 'groq-sdk';
 export const PROVIDERS = ['gemini', 'anthropic', 'openai', 'groq'];
 
 export const DEFAULT_MODELS = {
-  gemini:    'gemini-2.0-flash',        // free tier, already the lightweight model
+  gemini:    'gemini-2.0-flash-lite',    // free tier, 30 RPM vs 15 RPM for regular flash
   anthropic: 'claude-haiku-4-5-20251001', // Haiku 4.5 — cheapest Claude with tool use
   openai:    'gpt-4o-mini',             // ~15x cheaper than gpt-4o, reliable tool use
   groq:      'llama-3.3-70b-versatile', // free; smaller models are unreliable for tool use
@@ -159,15 +159,34 @@ async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, 
     : [{ role: 'system', content: systemPrompt }, ...priorMessages, { role: 'user', content: task }];
   const recentTools = [];
 
+  let geminiRetried = false;
+
+  const geminiRequest = () => client.chat.completions.create({
+    model,
+    max_tokens: 4096,
+    tools: formattedTools,
+    tool_choice: 'auto',
+    messages,
+  });
+
   try {
     for (let turn = 0; turn < MAX_TURNS; turn++) {
-      const response = await client.chat.completions.create({
-        model,
-        max_tokens: 4096,
-        tools: formattedTools,
-        tool_choice: 'auto',
-        messages,
-      });
+      let response;
+      try {
+        response = await geminiRequest();
+      } catch (e) {
+        const status = e?.status ?? e?.response?.status;
+        const body   = e?.message || e?.error?.message || '';
+        const isRateLimit = status === 429 || body.includes('429') || body.toLowerCase().includes('quota') || body.toLowerCase().includes('rate');
+        if (isRateLimit && !geminiRetried) {
+          geminiRetried = true;
+          console.warn('[Agent] Gemini 429 — waiting 15s and retrying once...');
+          await new Promise(r => setTimeout(r, 15000));
+          response = await geminiRequest();
+        } else {
+          throw e;
+        }
+      }
 
       const choice = response.choices?.[0];
       if (!choice) throw new Error('Gemini returned empty choices — likely a quota or auth error');
