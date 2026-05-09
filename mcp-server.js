@@ -739,20 +739,18 @@ export function createCallTool(session) {
 
   async function handleReportConfirmedAddresses() {
     return withBrowser(async () => {
-      await session.navigate(PAGES.territoryList);
+      await session.navigate(PAGES.statsByGrouping);
 
-      const result = await session.evaluate(() => {
+      return session.evaluate(() => {
         const table = [...document.querySelectorAll('table')].find(t => t.querySelector('th'));
-        if (!table) return { error: 'No table found on Territory List Report page.' };
+        if (!table) return { error: 'No table found on Stats by Groupings page.' };
 
         const headers = [...table.querySelectorAll('thead th, tr:first-child th, tr:first-child td')]
           .map(h => h.textContent.trim());
 
-        // Locate the confirmed column — OTM uses "# Confirmed" or "Confirmed"
         const confirmedIdx = headers.findIndex(h => /confirm/i.test(h));
-        const totalIdx     = headers.findIndex(h => /^#?\s*(total|addr)/i.test(h));
-        const numIdx       = headers.findIndex(h => /^#?\s*(num|ter\s*#|territory\s*#)/i.test(h));
-        const nameIdx      = headers.findIndex(h => /name/i.test(h));
+        const groupIdx     = headers.findIndex(h => /group|name/i.test(h));
+        const totalIdx     = headers.findIndex(h => /total/i.test(h));
 
         if (confirmedIdx === -1) {
           return { error: 'Could not find a "Confirmed" column in the report.', headers };
@@ -763,23 +761,20 @@ export function createCallTool(session) {
           .filter(r => r.length > confirmedIdx && r.some(c => c));
 
         let totalConfirmed = 0;
-        const territories = [];
+        const groups = [];
         for (const row of rows) {
           const confirmed = parseInt(row[confirmedIdx]?.replace(/,/g, '') || '0', 10);
           if (isNaN(confirmed)) continue;
           totalConfirmed += confirmed;
-          territories.push({
-            territory: numIdx  !== -1 ? row[numIdx]  : undefined,
-            name:      nameIdx !== -1 ? row[nameIdx] : undefined,
+          groups.push({
+            group:     groupIdx !== -1 ? row[groupIdx] : undefined,
             total:     totalIdx !== -1 ? parseInt(row[totalIdx]?.replace(/,/g, '') || '0', 10) : undefined,
             confirmed,
           });
         }
 
-        return { totalConfirmed, territories, headers };
+        return { totalConfirmed, groups, headers };
       });
-
-      return result;
     });
   }
 

@@ -8,7 +8,7 @@ export const DEFAULT_MODELS = {
   gemini:    'gemini-2.0-flash-lite',    // free tier, 30 RPM vs 15 RPM for regular flash
   anthropic: 'claude-haiku-4-5-20251001', // Haiku 4.5 — cheapest Claude with tool use
   openai:    'gpt-4o-mini',             // ~15x cheaper than gpt-4o, reliable tool use
-  groq:      'llama-3.3-70b-versatile', // free; smaller models are unreliable for tool use
+  groq:      'llama-3.1-8b-instant',     // free; cheaper/faster than 70b — monitor for tool-use reliability
 };
 
 const MAX_TURNS = 12; // If not done in 12 turns something is wrong.
