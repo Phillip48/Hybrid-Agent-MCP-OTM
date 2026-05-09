@@ -253,7 +253,7 @@ export const OTM_TOOLS = [
   // ── Address entry ──────────────────────────────────────────────────────────
   {
     name: 'add_address',
-    description: 'Adds a new address to OTM. Checks for duplicates in AddrSearch.php first. If not found, fills AdminSingleAddr.php with the address details, sets language to Portuguese, clicks Get Lat/Long, then saves. Territory and address type are left as default (NA / Residential).',
+    description: 'Adds a new address to OTM. Searches AddrSearch.php first — if the address already exists, stops immediately and returns an error. If not found, navigates to AdminSingleAddr.php, fills house number, street, city, state, zip, clicks Get Lat/Long, then saves. Language defaults to Portuguese (set via hidden field). Territory and address type are left as default.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1117,45 +1117,16 @@ export function createCallTool(session) {
 
   async function handleAddAddress({ street_number, street_name, unit, city, state = 'FL', zip, confirmed = false } = {}) {
     return withBrowser(async () => {
-      const fullStreet = `${street_number} ${street_name}${unit ? ` ${unit}` : ''}`.trim();
-      console.log(`[add_address] Checking if "${fullStreet}, ${city ?? 'Central FL'}" already exists`);
+      const fullAddress = `${street_number} ${street_name}${unit ? ` ${unit}` : ''}${city ? `, ${city}` : ''}${zip ? ` ${zip}` : ''}`.trim();
+      console.log(`[add_address] Checking if "${fullAddress}" already exists`);
 
-      // ── Step 0: Look up city/zip if not provided ───────────────────────────
-      // Address is always in Central FL — use OTM's geocoding page or search.
-      if (!city || !zip) {
-        console.log(`[add_address] Partial address — looking up city/zip for "${fullStreet}, FL"`);
-        try {
-          await session.page.goto(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(`${fullStreet}, Florida, USA`)}&format=json&limit=1&addressdetails=1`, { waitUntil: 'domcontentloaded', timeout: 10000 });
-          const geoData = await session.evaluate(() => {
-            try { return JSON.parse(document.body.innerText); } catch { return null; }
-          });
-          if (geoData?.length > 0) {
-            const addr = geoData[0].address;
-            city = city || addr.city || addr.town || addr.village || addr.hamlet || addr.county || city;
-            zip  = zip  || addr.postcode || zip;
-            console.log(`[add_address] Resolved city="${city}" zip="${zip}"`);
-          }
-        } catch (e) {
-          console.warn(`[add_address] Geocode lookup failed: ${e.message}`);
-        }
-        // Navigate back to OTM after geocoding lookup.
-        await session.navigate(PAGES.addrSearch);
-      }
-
-      // ── Step 1: Search for the address in AddrSearch.php ─────────────────
+      // ── Step 1: Search AddrSearch.php for duplicates ──────────────────────
       await session.navigate(PAGES.addrSearch);
 
-      // Try to fill whatever search fields exist on the page.
-      const searchFields = [
-        ['input[name*="housenum" i], input[name*="streetnum" i], input[name*="addr" i]', street_number],
-        ['input[name*="streetname" i], input[name*="street" i]', street_name],
-        ['input[name*="city" i]', city ?? ''],
-        ['input[name*="zip" i]', zip ?? ''],
-      ];
-      for (const [sel, val] of searchFields) {
-        if (!val) continue;
-        try { await session.fill(sel, val); } catch {}
-      }
+      // Fill street number + street name — the most reliable duplicate signal.
+      try { await session.fill('input[name="Addr"]',   street_number); } catch {}
+      try { await session.fill('input[name="Street"]', street_name);   } catch {}
+      if (city) { try { await session.fill('input[name="City"]', city); } catch {} }
 
       await session.evaluate(() => {
         const btn = document.querySelector('input[type="submit"], button[type="submit"]');
@@ -1169,128 +1140,76 @@ export function createCallTool(session) {
       );
 
       if (searchResults.length > 0) {
-        console.log(`[add_address] Already exists — ${searchResults.length} record(s)`);
+        console.log(`[add_address] Already exists — ${searchResults.length} record(s). Stopping.`);
         return {
+          error: true,
           already_exists: true,
-          message: `Address already exists in OTM (${searchResults.length} matching record(s) found). Not added.`,
-          existing_records: searchResults.slice(0, 10),
+          message: `Address already exists in OTM — not added. ${searchResults.length} matching record(s) found: ${searchResults.slice(0, 3).join(' | ')}`,
         };
       }
 
-      console.log(`[add_address] Not found — opening entry form`);
+      console.log(`[add_address] Not found — navigating to entry form`);
 
-      // ── Step 2: Navigate to entry form (AdminSingleAddr.php) ─────────────
+      // ── Step 2: Navigate directly to AdminSingleAddr.php ─────────────────
       await session.navigate(PAGES.addrEntry);
+      await session.page.waitForLoadState('domcontentloaded');
 
-      // Read the form HTML so we can see the actual field names.
-      const formFields = await session.evaluate(() =>
-        [...document.querySelectorAll('input, select, textarea')]
-          .map(el => ({ tag: el.tagName, name: el.name, id: el.id, type: el.type, placeholder: el.placeholder }))
-          .filter(el => el.name)
-      );
-      console.log(`[add_address] Form fields found:`, JSON.stringify(formFields.map(f => f.name)));
+      // ── Step 3: Fill form fields (exact names from AdminSingleAddr.php) ───
+      // House number → Addr field
+      await session.fill('input[name="Addr"]',   street_number);
+      // Street name → Street field
+      await session.fill('input[name="Street"]', street_name);
+      // Apt/unit (optional)
+      if (unit) {
+        try { await session.fill('input[name="Apt"]', unit); } catch {}
+      }
+      // City, State, Zip
+      if (city) await session.fill('input[name="City"]',  city);
+      await session.fill('input[name="State"]', state);
+      if (zip)  await session.fill('input[name="Zip"]',   zip);
 
-      // ── Step 3: Fill address fields ───────────────────────────────────────
-      // Helper: fill a field by trying multiple selector candidates.
-      const fillField = async (candidates, value) => {
-        if (!value) return;
-        for (const sel of candidates) {
-          try {
-            const tag = await session.evaluate(s => document.querySelector(s)?.tagName?.toLowerCase(), sel);
-            if (!tag) continue;
-            if (tag === 'select') {
-              await session.page.selectOption(sel, { label: value }).catch(async () => {
-                // Fallback: match by value text
-                await session.evaluate((s, v) => {
-                  const el  = document.querySelector(s);
-                  if (!el) return;
-                  const opt = [...el.options].find(o => o.text.toLowerCase().includes(v.toLowerCase()));
-                  if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); }
-                }, sel, value);
-              });
-            } else {
-              await session.fill(sel, value);
-            }
-            return;
-          } catch {}
-        }
-      };
+      console.log(`[add_address] Form filled — ${street_number} ${street_name}${unit ? ` ${unit}` : ''}, ${city ?? ''} ${state} ${zip ?? ''}`);
 
-      // Street number
-      await fillField(['input[name="HouseNum"]', 'input[name="housenum"]', 'input[name="StreetNum"]', 'input[name="Addr1"]', 'input[id*="house" i]', 'input[id*="num" i]'], street_number);
-      // Street name
-      await fillField(['input[name="StreetName"]', 'input[name="streetname"]', 'input[name="Street"]', 'input[id*="street" i]'], street_name);
-      // Unit/apt
-      if (unit) await fillField(['input[name="Apt"]', 'input[name="apt"]', 'input[name="Unit"]', 'input[name="unit"]', 'input[id*="apt" i]', 'input[id*="unit" i]'], unit);
-      // City
-      await fillField(['input[name="City"]', 'input[name="city"]', 'input[id*="city" i]'], city ?? '');
-      // State (always FL)
-      await fillField(['input[name="State"]', 'input[name="state"]', 'select[name="State"]', 'select[name="state"]', 'input[id*="state" i]'], state);
-      // Zip
-      await fillField(['input[name="Zip"]', 'input[name="zip"]', 'input[name="ZipCode"]', 'input[id*="zip" i]'], zip ?? '');
+      // Language is already set to Portuguese via hidden field — no action needed.
 
-      // ── Step 4: Set language to Portuguese ────────────────────────────────
-      await session.evaluate(() => {
-        const langSels = ['select[name="Lang"]', 'select[name="lang"]', 'select[name="Language"]', 'select[name*="lang" i]'];
-        for (const s of langSels) {
-          const el = document.querySelector(s);
-          if (!el) continue;
-          const opt = [...el.options].find(o => /portug|por\b/i.test(o.text + o.value));
-          if (opt) { el.value = opt.value; el.dispatchEvent(new Event('change', { bubbles: true })); return; }
-        }
-      });
-      console.log(`[add_address] Language set to Portuguese`);
-
-      // ── Step 5: Mark confirmed if requested ───────────────────────────────
+      // ── Step 4: Mark confirmed if requested ───────────────────────────────
       if (confirmed) {
         await session.evaluate(() => {
-          const cb = document.querySelector('input[type="checkbox"][name*="confirm" i], input[type="checkbox"][id*="confirm" i]');
-          if (cb && !cb.checked) { cb.checked = true; cb.dispatchEvent(new Event('change', { bubbles: true })); }
+          const sel = document.querySelector('select[name="Confirmed"]');
+          if (sel) { sel.value = '1'; sel.dispatchEvent(new Event('change', { bubbles: true })); }
         });
         console.log(`[add_address] Marked as confirmed`);
       }
 
-      // ── Step 6: Click Get Lat/Long ────────────────────────────────────────
+      // ── Step 5: Click Get Lat/Long ────────────────────────────────────────
       console.log(`[add_address] Clicking Get Lat/Long`);
-      const latLongClicked = await session.evaluate(() => {
-        const btn = [...document.querySelectorAll('a, button, input[type="button"], input[type="submit"]')]
-          .find(el => /lat.?long|geocod|get.?coord|get.?loc/i.test(el.textContent + el.value + el.title));
-        if (btn) { btn.click(); return btn.textContent?.trim() || btn.value || true; }
-        return false;
-      });
-
-      if (latLongClicked) {
-        // Wait for lat/long fields to populate (geocoding API call).
-        await session.page.waitForFunction(() => {
-          const lat = document.querySelector('input[name="Lat"], input[name="lat"], input[id*="lat" i]');
-          return lat && lat.value && lat.value !== '0' && lat.value !== '';
-        }, { timeout: 10000 }).catch(() => {
-          console.warn(`[add_address] Lat/long did not populate within 10s — saving anyway`);
-        });
-        console.log(`[add_address] Lat/Long populated`);
-      } else {
-        console.warn(`[add_address] Get Lat/Long button not found — saving without coordinates`);
+      try {
+        await session.page.click('input[type="button"][value="Get Lat/Long"]');
+        // Wait up to 12s for lat field to populate.
+        await session.page.waitForFunction(
+          () => { const el = document.getElementById('Lat'); return el && el.value && el.value !== ''; },
+          { timeout: 12000 }
+        ).catch(() => console.warn(`[add_address] Lat/Long did not populate — saving anyway`));
+        const lat = await session.evaluate(() => document.getElementById('Lat')?.value);
+        const lng = await session.evaluate(() => document.getElementById('Lng')?.value);
+        console.log(`[add_address] Lat/Long: ${lat}, ${lng}`);
+      } catch (e) {
+        console.warn(`[add_address] Get Lat/Long click failed: ${e.message}`);
       }
 
-      // ── Step 7: Save ──────────────────────────────────────────────────────
-      console.log(`[add_address] Saving`);
-      await session.evaluate(() => {
-        // Click Save — prefer a button explicitly labelled Save, not Get Lat/Long.
-        const btn = [...document.querySelectorAll('input[type="submit"], button[type="submit"]')]
-          .find(el => !/lat|geo|coord/i.test(el.value + el.textContent));
-        if (btn) btn.click();
-      });
+      // ── Step 6: Click Save ────────────────────────────────────────────────
+      console.log(`[add_address] Clicking Save`);
+      await session.page.click('input[name="save"]');
       await session.page.waitForLoadState('networkidle').catch(() => {});
 
       const resultText = await session.evaluate(() => document.body.innerText);
       const success    = /success|saved|added|record/i.test(resultText);
+      console.log(`[add_address] Save result: ${success ? 'success' : 'unclear'}`);
 
       return {
         success,
-        address: [fullStreet, city, state, zip].filter(Boolean).join(', '),
+        address: fullAddress,
         confirmed,
-        language: 'Portuguese',
-        latLongClicked: !!latLongClicked,
         result: resultText.slice(0, 500),
       };
     });
