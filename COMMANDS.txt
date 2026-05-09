@@ -113,10 +113,11 @@ MCP SERVER (for Claude Desktop)
   OTM_USER              Your OTM login username
   OTM_PASS              Your OTM login password
   HEADLESS              true (invisible) | false (visible browser for debugging)
-  AI_PROVIDER           Default provider: anthropic | openai | groq
-  ANTHROPIC_API_KEY     API key from console.anthropic.com
-  OPENAI_API_KEY        API key from platform.openai.com
-  GROQ_API_KEY          API key from console.groq.com
+  AI_PROVIDER           Last-resort fallback provider: anthropic | openai | groq
+  GEMINI_API_KEY        API key from aistudio.google.com (tried first — free)
+  GROQ_API_KEY          API key from console.groq.com (tried second — free)
+  ANTHROPIC_API_KEY     API key from console.anthropic.com (last fallback)
+  OPENAI_API_KEY        API key from platform.openai.com (alternative fallback)
   GEO_KEY               Geocodio API key (required for route_territory)
   TELEGRAM_BOT_TOKEN    Token from @BotFather on Telegram
   TELEGRAM_ADMIN_IDS    Your Telegram user ID (comma-separated for multiple)

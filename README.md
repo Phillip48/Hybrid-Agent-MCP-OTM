@@ -68,18 +68,22 @@ Admins can also restart the bot directly from Telegram with `/restart` without n
 
 ## Provider Strategy
 
-The bot always tries **Groq first** because it's free. If Groq fails (rate limit, token cap, or tool-use error), it automatically retries the same task with your configured fallback provider (default: Anthropic).
+Every task runs through a three-tier free-first chain. Gemini and Groq are both free-tier; Anthropic is only reached if both fail.
 
 ```
-Every task → Groq (llama-3.3-70b-versatile)
+Every task → Gemini (gemini-2.0-flash)        ← free, tried first
                 │
                 ├─ success → done
-                └─ failure → fallback provider (anthropic / openai)
+                └─ failure → Groq (llama-3.3-70b-versatile)  ← free fallback
+                                │
+                                ├─ success → done
+                                └─ failure → Anthropic / OpenAI  ← last resort
 ```
 
-- Set your fallback provider in Telegram with `/setprovider anthropic`
-- Set the default fallback in `.env` with `AI_PROVIDER=anthropic`
-- If you set your provider to `groq`, no fallback is used
+- Set your last-resort fallback in Telegram with `/setprovider anthropic`
+- Set the default last-resort in `.env` with `AI_PROVIDER=anthropic`
+- `GEMINI_API_KEY` is required — get a free key at [aistudio.google.com](https://aistudio.google.com)
+- `GROQ_API_KEY` is required — free at [console.groq.com](https://console.groq.com)
 
 ## Setup
 
@@ -104,11 +108,12 @@ OTM_USER=your_email@example.com
 OTM_PASS=your_password
 HEADLESS=true                  # set to false to watch the browser
 
-AI_PROVIDER=anthropic          # fallback provider (groq is always tried first)
+AI_PROVIDER=anthropic          # last-resort fallback (gemini → groq → this)
 
-ANTHROPIC_API_KEY=sk-ant-...
-OPENAI_API_KEY=sk-...
-GROQ_API_KEY=gsk_...           # required — Groq is always the first attempt
+GEMINI_API_KEY=AIza...         # required — free at aistudio.google.com
+GROQ_API_KEY=gsk_...           # required — free at console.groq.com
+ANTHROPIC_API_KEY=sk-ant-...   # last-resort fallback key
+OPENAI_API_KEY=sk-...          # alternative last-resort
 
 GEO_KEY=your_geocodio_api_key  # required for route_territory
 ```
@@ -139,9 +144,10 @@ node index.js -p anthropic "Assign territory 42 to Jane Smith"
 
 | Provider | Default model | Notes |
 |----------|--------------|-------|
-| `groq` | `llama-3.3-70b-versatile` | Always tried first — free tier, fastest inference |
-| `anthropic` | `claude-sonnet-4-20250514` | Recommended fallback — best for complex multi-step tasks |
-| `openai` | `gpt-4o` | Alternative fallback — strong tool use |
+| `gemini` | `gemini-2.0-flash` | Always tried first — free tier |
+| `groq` | `llama-3.3-70b-versatile` | Second attempt — free tier |
+| `anthropic` | `claude-sonnet-4-20250514` | Last-resort fallback — best for complex tasks |
+| `openai` | `gpt-4o` | Alternative last-resort — strong tool use |
 
 ### Example tasks
 
@@ -231,7 +237,7 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 1. **On first run** the agent logs in with your OTM credentials and saves the session cookies to `cookies.json`.
 2. **On subsequent runs** the saved cookies are loaded — login is skipped unless the session has expired.
-3. **The agentic loop** sends your task to Groq first. If Groq fails for any reason, the full task is retried automatically with your configured fallback provider (Anthropic by default).
+3. **The agentic loop** sends your task to Gemini first (free). If Gemini fails, it retries with Groq (also free). If Groq fails, it falls back to your configured last-resort provider (Anthropic by default).
 4. **Tool format normalization** — `providers.js` converts the OTM tool definitions to each provider's format (Anthropic `input_schema` vs OpenAI/Groq `parameters`) and translates their different message history structures transparently.
 5. **Errors are surfaced gracefully** — Playwright failures are returned as tool results so the model can retry with a different approach.
 
@@ -244,8 +250,9 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 | Login fails | Check `OTM_USER` / `OTM_PASS`; set `HEADLESS=false` to watch |
 | "Element not found" | Use `take_screenshot` or `get_page_content` to inspect the page |
 | Session keeps expiring | Delete `cookies.json` to force a fresh login |
-| Groq keeps failing | Set `AI_PROVIDER=anthropic` in `.env` as the fallback; Groq will still be tried first |
-| Task fails on both providers | Check API keys in `.env`; try `--provider anthropic` directly |
+| Gemini keeps failing | Check `GEMINI_API_KEY`; Groq will take over automatically |
+| Groq keeps failing | Check `GROQ_API_KEY`; Anthropic will take over automatically |
+| Task fails on all providers | Check all API keys in `.env`; try `--provider anthropic` directly |
 
 ---
 

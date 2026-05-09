@@ -13,7 +13,7 @@ import { BrowserSession } from './browser.js';
 
 const TOKEN     = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_IDS = (process.env.TELEGRAM_ADMIN_IDS || '').split(',').map(s => s.trim()).filter(Boolean);
-const PROVIDER  = process.env.AI_PROVIDER || 'anthropic';
+const PROVIDER  = 'gemini';
 const MODEL     = DEFAULT_MODELS[PROVIDER];
 
 if (!TOKEN) {
@@ -271,15 +271,15 @@ async function runTask(ctx, userId, task) {
   const history  = getHistory(userId);
   if (history.length > 0) log(userId, `Resuming conversation — ${history.length / 2} prior exchange(s) in context`);
 
-  const user             = await getUser(userId);
-  const configProvider   = user.provider || process.env.AI_PROVIDER || 'anthropic';
-  const configModel      = user.model    || DEFAULT_MODELS[configProvider];
-  // Always try Groq first (free). Fall back to the user's configured provider if Groq fails.
-  const PROVIDER         = 'groq';
-  const MODEL            = DEFAULT_MODELS['groq'];
-  const FALLBACK_PROVIDER = configProvider !== 'groq' ? configProvider : null;
+  const user           = await getUser(userId);
+  const configProvider = user.provider || process.env.AI_PROVIDER || 'anthropic';
+  // Always try Gemini first (free), then Groq (free), then the user's configured fallback.
+  const PROVIDER       = 'gemini';
+  const MODEL          = DEFAULT_MODELS['gemini'];
+  const FALLBACK_CHAIN = ['groq', configProvider !== 'gemini' && configProvider !== 'groq' ? configProvider : 'anthropic']
+    .filter((v, i, a) => a.indexOf(v) === i);
 
-  log(userId, `Provider: ${PROVIDER} | Model: ${MODEL}${FALLBACK_PROVIDER ? ` | Fallback: ${FALLBACK_PROVIDER}` : ''}`);
+  log(userId, `Provider chain: ${[PROVIDER, ...FALLBACK_CHAIN].join(' → ')}`);
   const browserSession = sessionManager.getOrCreate(userId, {
     otmUser: user.otmUser,
     otmPass: user.otmPass,
@@ -325,14 +325,14 @@ async function runTask(ctx, userId, task) {
         task,
         provider: PROVIDER,
         model: MODEL,
-        fallbackProvider: FALLBACK_PROVIDER,
+        fallbackChain: FALLBACK_CHAIN,
         systemPrompt: SYSTEM_PROMPT,
         tools: OTM_TOOLS,
         callTool,
         priorMessages: history,
         onFallback: (fallback, reason) => {
-          log(userId, `Groq failed (${reason}), falling back to ${fallback}`);
-          safeEdit(ctx, statusMsg.message_id, `⚡ Groq failed — retrying with ${fallback}...\n\`\`\`\n${toolLog.join('\n') || '(no tools called yet)'}\n\`\`\``).catch(() => {});
+          log(userId, `Provider failed (${reason}), switching to ${fallback}`);
+          safeEdit(ctx, statusMsg.message_id, `⚡ Switching to ${fallback}...\n\`\`\`\n${toolLog.join('\n') || '(no tools called yet)'}\n\`\`\``).catch(() => {});
         },
         onText: (text) => {
           finalText = text;
@@ -451,14 +451,12 @@ bot.command('status', async (ctx) => {
     await ctx.reply('Not set up yet. Send /setup to connect your OTM account.');
     return;
   }
-  const active        = activeTasks.has(userId) ? '\n🔄 A task is currently running.' : '';
-  const fallbackProv  = user.provider || process.env.AI_PROVIDER || 'anthropic';
-  const fallbackModel = user.model    || DEFAULT_MODELS[fallbackProv];
-  const providerLine  = fallbackProv === 'groq'
-    ? `Provider: \`groq\` / \`${DEFAULT_MODELS['groq']}\``
-    : `Provider: \`groq\` → \`${fallbackProv}\` / \`${fallbackModel}\` (fallback)`;
+  const active       = activeTasks.has(userId) ? '\n🔄 A task is currently running.' : '';
+  const lastFallback = user.provider || process.env.AI_PROVIDER || 'anthropic';
+  const chain        = ['gemini', 'groq', lastFallback].filter((v, i, a) => a.indexOf(v) === i);
+  const providerLine = `Provider chain: \`${chain.join(' → ')}\``;
   await ctx.reply(
-    `✅ *Connected*\nAccount: \`${user.otmUser}\`\n${providerLine}${active}\n\nSend /setup to update credentials or /setprovider to change fallback.`,
+    `✅ *Connected*\nAccount: \`${user.otmUser}\`\n${providerLine}${active}\n\nSend /setup to update credentials or /setprovider to change last-resort fallback.`,
     { parse_mode: 'Markdown' },
   );
 });
