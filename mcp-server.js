@@ -173,6 +173,11 @@ export const OTM_TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'report_confirmed_addresses',
+    description: 'Returns total confirmed addresses across all territories, plus a per-territory breakdown with territory number, name, total addresses, and confirmed count. Pulls live data from the Territory List Report.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'report_letter_writing',
     description: 'Letter Writing Stats — statistics on letter writing activity across territories.',
     inputSchema: { type: 'object', properties: {} },
@@ -730,6 +735,52 @@ export function createCallTool(session) {
 
   async function handleReportTerritoryExport() {
     return withBrowser(() => scrapeReportPage(PAGES.territoryExport));
+  }
+
+  async function handleReportConfirmedAddresses() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.territoryList);
+
+      const result = await session.evaluate(() => {
+        const table = [...document.querySelectorAll('table')].find(t => t.querySelector('th'));
+        if (!table) return { error: 'No table found on Territory List Report page.' };
+
+        const headers = [...table.querySelectorAll('thead th, tr:first-child th, tr:first-child td')]
+          .map(h => h.textContent.trim());
+
+        // Locate the confirmed column — OTM uses "# Confirmed" or "Confirmed"
+        const confirmedIdx = headers.findIndex(h => /confirm/i.test(h));
+        const totalIdx     = headers.findIndex(h => /^#?\s*(total|addr)/i.test(h));
+        const numIdx       = headers.findIndex(h => /^#?\s*(num|ter\s*#|territory\s*#)/i.test(h));
+        const nameIdx      = headers.findIndex(h => /name/i.test(h));
+
+        if (confirmedIdx === -1) {
+          return { error: 'Could not find a "Confirmed" column in the report.', headers };
+        }
+
+        const rows = [...table.querySelectorAll('tbody tr, tr:not(:first-child)')]
+          .map(tr => [...tr.querySelectorAll('td')].map(td => td.textContent.trim()))
+          .filter(r => r.length > confirmedIdx && r.some(c => c));
+
+        let totalConfirmed = 0;
+        const territories = [];
+        for (const row of rows) {
+          const confirmed = parseInt(row[confirmedIdx]?.replace(/,/g, '') || '0', 10);
+          if (isNaN(confirmed)) continue;
+          totalConfirmed += confirmed;
+          territories.push({
+            territory: numIdx  !== -1 ? row[numIdx]  : undefined,
+            name:      nameIdx !== -1 ? row[nameIdx] : undefined,
+            total:     totalIdx !== -1 ? parseInt(row[totalIdx]?.replace(/,/g, '') || '0', 10) : undefined,
+            confirmed,
+          });
+        }
+
+        return { totalConfirmed, territories, headers };
+      });
+
+      return result;
+    });
   }
 
   async function handleReportLetterWriting() {
@@ -1296,6 +1347,7 @@ export function createCallTool(session) {
       case 'report_stats_by_grouping':    return handleReportStatsByGrouping();
       case 'report_address_demographics': return handleReportAddressDemographics();
       case 'report_territory_export':     return handleReportTerritoryExport();
+      case 'report_confirmed_addresses':  return handleReportConfirmedAddresses();
       case 'report_letter_writing':       return handleReportLetterWriting();
       case 'report_address_export':       return handleReportAddressExport();
       // Address tools
