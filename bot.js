@@ -673,13 +673,42 @@ bot.on(message('text'), async (ctx) => {
 
 // ── Launch ────────────────────────────────────────────────────────────────────
 
-bot.launch().then(() => {
+bot.launch().then(async () => {
   console.log('');
   console.log('[bot] ✅ OTM Telegram Bot is running');
   console.log(`[bot]    Provider : ${PROVIDER}`);
   console.log(`[bot]    Model    : ${MODEL}`);
   console.log(`[bot]    Admins   : ${ADMIN_IDS.join(', ') || '(none set — set TELEGRAM_ADMIN_IDS in .env)'}`);
   console.log('');
+
+  // Register user-facing commands (shown in Telegram's "/" menu).
+  await bot.telegram.setMyCommands([
+    { command: 'start',       description: 'Welcome message and quick-start examples' },
+    { command: 'status',      description: 'Check connection, Gemini availability, and recent logs' },
+    { command: 'setup',       description: 'Connect or update your OTM account credentials' },
+    { command: 'setprovider', description: 'Change the last-resort AI fallback provider' },
+    { command: 'debug',       description: 'Test your OTM browser session' },
+    { command: 'myid',        description: 'Show your Telegram user ID' },
+    { command: 'cancel',      description: 'Cancel the current setup wizard' },
+  ]).catch(e => console.warn('[bot] setMyCommands failed:', e.message));
+
+  // Register admin-only commands in each admin's private chat.
+  for (const adminId of ADMIN_IDS) {
+    await bot.telegram.setMyCommands([
+      { command: 'start',       description: 'Welcome message and quick-start examples' },
+      { command: 'status',      description: 'Check connection, Gemini availability, and recent logs' },
+      { command: 'setup',       description: 'Connect or update your OTM account credentials' },
+      { command: 'setprovider', description: 'Change the last-resort AI fallback provider' },
+      { command: 'debug',       description: 'Test your OTM browser session' },
+      { command: 'myid',        description: 'Show your Telegram user ID' },
+      { command: 'cancel',      description: 'Cancel the current setup wizard' },
+      { command: 'allow',       description: '[Admin] Allow a user by Telegram ID' },
+      { command: 'deny',        description: '[Admin] Remove a user by Telegram ID' },
+      { command: 'users',       description: '[Admin] List all registered users' },
+      { command: 'restart',     description: '[Admin] Restart the bot process' },
+    ], { scope: { type: 'chat', chat_id: Number(adminId) } })
+      .catch(e => console.warn(`[bot] setMyCommands for admin ${adminId} failed:`, e.message));
+  }
 }).catch(e => {
   console.error('[bot] Failed to start:', e.message);
   process.exit(1);
