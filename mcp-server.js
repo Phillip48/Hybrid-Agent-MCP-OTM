@@ -1073,14 +1073,17 @@ export function createCallTool(session) {
         failed.forEach(a => console.warn(`  - ${a}`));
       }
 
-      // ── Step 6: Order via nearest-neighbor from home base ───────────────
-      // Produces a logical driving path instead of zigzagging by raw distance.
+      // ── Step 6: Order via nearest-neighbor then 2-opt refinement ───────────
+      // Nearest-neighbor gives a reasonable initial route; 2-opt eliminates
+      // crossings by repeatedly reversing segments that reduce total distance.
       // Ungeocodable addresses (no coords) are appended at the end.
       const withCoords    = geocoded.filter(g => g.coords);
       const withoutCoords = geocoded.filter(g => !g.coords);
-      const ordered       = [];
-      let   current       = { lat: HOME_LAT, lon: HOME_LON };
-      const unvisited     = [...withCoords];
+
+      // Nearest-neighbor pass
+      const ordered   = [];
+      let   current   = { lat: HOME_LAT, lon: HOME_LON };
+      const unvisited = [...withCoords];
 
       while (unvisited.length > 0) {
         let nearestIdx  = 0;
@@ -1094,7 +1097,41 @@ export function createCallTool(session) {
         current = next.coords;
       }
 
-      const sorted    = [...ordered, ...withoutCoords];
+      // 2-opt refinement — eliminates route crossings for an open path.
+      // For each pair of edges, try reversing the segment between them;
+      // keep the reversal if it shortens the total path.
+      function twoOpt(route) {
+        const n = route.length;
+        let improved = true;
+        while (improved) {
+          improved = false;
+          for (let i = 0; i < n - 1; i++) {
+            for (let j = i + 1; j < n; j++) {
+              const prevI = i === 0 ? { lat: HOME_LAT, lon: HOME_LON } : route[i - 1].coords;
+              const nextJ = j === n - 1 ? null : route[j + 1].coords;
+
+              const costBefore =
+                haversineKm(prevI.lat, prevI.lon, route[i].coords.lat, route[i].coords.lon) +
+                (nextJ ? haversineKm(route[j].coords.lat, route[j].coords.lon, nextJ.lat, nextJ.lon) : 0);
+
+              const costAfter =
+                haversineKm(prevI.lat, prevI.lon, route[j].coords.lat, route[j].coords.lon) +
+                (nextJ ? haversineKm(route[i].coords.lat, route[i].coords.lon, nextJ.lat, nextJ.lon) : 0);
+
+              if (costAfter < costBefore - 1e-9) {
+                route = [...route.slice(0, i), ...route.slice(i, j + 1).reverse(), ...route.slice(j + 1)];
+                improved = true;
+              }
+            }
+          }
+        }
+        return route;
+      }
+
+      const refined = twoOpt(ordered);
+      console.log(`[route] 2-opt complete — ${refined.length} addresses optimized`);
+
+      const sorted    = [...refined, ...withoutCoords];
       const sortedIds = sorted.map(g => g.id);
       console.log(`[route] Route planned. First: ${sorted[0].addr} (${sorted[0].dist.toFixed(1)}km from home)`);
       console.log(`[route] Last:  ${sorted.at(-1).addr} (${sorted.at(-1).dist.toFixed(1)}km from home)`);
