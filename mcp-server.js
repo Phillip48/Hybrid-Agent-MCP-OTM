@@ -1192,24 +1192,72 @@ export function createCallTool(session) {
         return { route, iter };
       }
 
-      // Multi-start: try home + the 11 closest addresses to home as entry points.
-      // Each gives a different nearest-neighbor seed; we keep the shortest result.
-      const byDistToHome = [...withCoords].sort((a, b) => dc(H, coord(a)) - dc(H, coord(b)));
-      const startCoords  = [H, ...byDistToHome.slice(0, 11).map(coord)];
+      // ── Multi-start: geographically diverse entry points ─────────────────────
+      // For territories far from home (e.g. 70 miles away) "closest to home"
+      // clusters all starts on one edge. Use geographic extremes + centroid so
+      // starts cover the whole territory and explore more of the solution space.
+      const byLat = [...withCoords].sort((a, b) => coord(a).lat - coord(b).lat);
+      const byLon = [...withCoords].sort((a, b) => coord(a).lon - coord(b).lon);
+      const cLat  = withCoords.reduce((s, n) => s + coord(n).lat, 0) / withCoords.length;
+      const cLon  = withCoords.reduce((s, n) => s + coord(n).lon, 0) / withCoords.length;
+      const byDistHome = [...withCoords].sort((a, b) => dc(H, coord(a)) - dc(H, coord(b)));
 
-      let bestRoute  = null;
-      let bestLen    = Infinity;
-      let totalIter  = 0;
+      const startCoords = [
+        H,                                                           // from home
+        coord(byDistHome[0]),                                        // closest to home
+        coord(byLat[0]),                                             // southernmost
+        coord(byLat[byLat.length - 1]),                             // northernmost
+        coord(byLon[0]),                                             // westernmost
+        coord(byLon[byLon.length - 1]),                             // easternmost
+        { lat: cLat, lon: cLon },                                   // centroid
+        coord(withCoords[Math.floor(withCoords.length * 0.25)]),    // quarter-point
+        coord(withCoords[Math.floor(withCoords.length * 0.75)]),    // three-quarter-point
+      ];
+
+      let bestRoute = null;
+      let bestLen   = Infinity;
+      let totalIter = 0;
 
       for (const startCoord of startCoords) {
-        const seed           = nnRoute(withCoords, startCoord);
+        const seed            = nnRoute(withCoords, startCoord);
         const { route, iter } = optimizeFully(seed);
-        totalIter           += iter;
-        const len            = pathLength(route);
+        totalIter            += iter;
+        const len             = pathLength(route);
         if (len < bestLen) { bestLen = len; bestRoute = route; }
       }
 
-      console.log(`[route] Multi-start done — ${startCoords.length} starts, ${totalIter} total iterations, best path ${bestLen.toFixed(2)}km`);
+      console.log(`[route] Multi-start done — ${startCoords.length} starts, best ${bestLen.toFixed(2)}km`);
+
+      // ── Iterated Local Search (ILS) — escape local optima ────────────────────
+      // Double-bridge cuts the route at 3 random points and reconnects segments
+      // in a different order, producing solutions unreachable by 2-opt/Or-opt.
+      // We perturb the best solution and re-optimize; keep improvements.
+      function doubleBridge(route) {
+        const n = route.length;
+        if (n < 8) return route;
+        // Pick 3 distinct random cut positions (sorted).
+        const cuts = new Set();
+        while (cuts.size < 3) cuts.add(1 + Math.floor(Math.random() * (n - 1)));
+        const [a, b, c] = [...cuts].sort((x, y) => x - y);
+        // Reconnect: seg0 + seg2 + seg1 + seg3 (can't be reached by 2-opt).
+        return [...route.slice(0, a), ...route.slice(b, c), ...route.slice(a, b), ...route.slice(c)];
+      }
+
+      const ILS_ROUNDS = 30;
+      let ilsIter = 0;
+      for (let i = 0; i < ILS_ROUNDS; i++) {
+        const perturbed       = doubleBridge(bestRoute);
+        const { route, iter } = optimizeFully(perturbed);
+        ilsIter              += iter;
+        const len             = pathLength(route);
+        if (len < bestLen - 1e-9) {
+          bestLen   = len;
+          bestRoute = route;
+          console.log(`[route] ILS improvement at round ${i + 1}: ${len.toFixed(2)}km`);
+        }
+      }
+
+      console.log(`[route] ILS done — ${ILS_ROUNDS} rounds, ${ilsIter} iters, final path ${bestLen.toFixed(2)}km`);
 
       const sorted    = [...bestRoute, ...withoutCoords];
       const sortedIds = sorted.map(g => g.id);
