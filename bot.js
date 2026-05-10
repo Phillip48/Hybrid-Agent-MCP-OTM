@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 import 'dotenv/config';
+import { createReadStream } from 'fs';
+import { join } from 'path';
 import { Telegraf } from 'telegraf';
 import { message } from 'telegraf/filters';
 import { getUser, setUser, getAllUsers, isAllowed, isRegistered } from './store.js';
@@ -168,10 +170,22 @@ async function handleSetupStep(ctx, userId, text) {
       log(userId, 'Launching test browser session');
       const testSession = new BrowserSession({ userId: `test_${userId}`, otmUser: state.data.otmUser, otmPass });
       await testSession.ensureLoggedIn();
+
+      // Grab congregation name while the session is still open.
+      let congregationName = null;
+      try {
+        await testSession.page.goto('https://onlineterritorymanager.com/GroupPref.php');
+        await testSession.page.waitForLoadState('networkidle');
+        congregationName = await testSession.page.inputValue('#GroupDescr');
+        log(userId, `Congregation name: ${congregationName}`);
+      } catch (e) {
+        warn(userId, 'Could not read congregation name:', e.message);
+      }
+
       await testSession.close();
       log(userId, 'Test login successful — saving credentials');
 
-      await setUser(userId, { otmUser: state.data.otmUser, otmPass, registered: true });
+      await setUser(userId, { otmUser: state.data.otmUser, otmPass, registered: true, ...(congregationName && { congregationName }) });
 
       // Destroy any stale session, then pre-build and authenticate the real one
       // so the first task doesn't have to wait for a cold login.
@@ -616,6 +630,48 @@ bot.command('setprovider', async (ctx) => {
   await ctx.reply(`✅ Provider set to *${newProvider}* — model: \`${resolvedModel}\``, { parse_mode: 'Markdown' });
 });
 
+bot.command('backup', async (ctx) => {
+  const userId = String(ctx.from.id);
+  log(userId, '/backup');
+
+  const user = await getUser(userId);
+  if (!user?.registered) {
+    await ctx.reply('Not set up yet. Send /setup first.');
+    return;
+  }
+
+  const msg = await ctx.reply('⏳ Creating OTM backup...');
+  const stopTyping = startTyping(ctx);
+
+  try {
+    const browserSession = sessionManager.getOrCreate(userId, {
+      otmUser: user.otmUser,
+      otmPass: user.otmPass,
+    });
+    const callTool = createCallTool(browserSession);
+    const result = await callTool('backup_otm', user.congregationName ? { congregation_name: user.congregationName } : {});
+
+    stopTyping();
+
+    if (result.error) {
+      await safeEdit(ctx, msg.message_id, `❌ Backup failed: ${result.message}`);
+      return;
+    }
+
+    await safeEdit(ctx, msg.message_id, `✅ Backup ready for ${result.congregation}. Sending ${result.files.length} files...`);
+
+    for (const filename of result.files) {
+      const filePath = join(process.cwd(), result.folder, filename);
+      await ctx.replyWithDocument({ source: createReadStream(filePath), filename });
+    }
+
+  } catch (e) {
+    stopTyping();
+    err(userId, 'Backup command failed:', e.message);
+    await safeEdit(ctx, msg.message_id, `❌ Backup error: ${e.message}`);
+  }
+});
+
 // ── Admin commands ────────────────────────────────────────────────────────────
 
 bot.command('allow', async (ctx) => {
@@ -703,6 +759,7 @@ bot.launch().then(async () => {
     { command: 'setprovider', description: 'Change the last-resort AI fallback provider' },
     { command: 'debug',       description: 'Test your OTM browser session' },
     { command: 'myid',        description: 'Show your Telegram user ID' },
+    { command: 'backup',      description: 'Download a fresh OTM backup (addresses, territory, routing)' },
     { command: 'cancel',      description: 'Cancel the current setup wizard' },
   ]).catch(e => console.warn('[bot] setMyCommands failed:', e.message));
 
@@ -715,6 +772,7 @@ bot.launch().then(async () => {
       { command: 'setprovider', description: 'Change the last-resort AI fallback provider' },
       { command: 'debug',       description: 'Test your OTM browser session' },
       { command: 'myid',        description: 'Show your Telegram user ID' },
+      { command: 'backup',      description: 'Download a fresh OTM backup (addresses, territory, routing)' },
       { command: 'cancel',      description: 'Cancel the current setup wizard' },
       { command: 'allow',       description: '[Admin] Allow a user by Telegram ID' },
       { command: 'deny',        description: '[Admin] Remove a user by Telegram ID' },
