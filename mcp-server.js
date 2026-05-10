@@ -275,8 +275,13 @@ export const OTM_TOOLS = [
   },
   {
     name: 'gated_address_report',
-    description: 'Checks every available territory on the checkout page and returns the percentage of gated addresses in each one, sorted highest to lowest.',
-    inputSchema: { type: 'object', properties: {} },
+    description: 'Returns the percentage of gated addresses per territory, sorted highest to lowest. If territory is provided (e.g. "S-14" or "14"), only that territory is checked; otherwise all territories are scanned.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        territory: { type: 'string', description: 'Optional territory name or number to check (e.g. "S-14" or "14"). Omit to check all territories.' },
+      },
+    },
   },
 ];
 
@@ -1590,7 +1595,7 @@ export function createCallTool(session) {
     }));
   }
 
-  async function handleGatedAddressReport() {
+  async function handleGatedAddressReport({ territory } = {}) {
     return withBrowser(async () => {
       const page = session.page;
 
@@ -1599,7 +1604,7 @@ export function createCallTool(session) {
       await page.waitForLoadState('networkidle');
 
       // Collect every territory link from the left panel.
-      const territories = await page.evaluate(() =>
+      let territories = await page.evaluate(() =>
         [...document.querySelectorAll('a[onclick*="getTerList"]')].map(a => {
           const m     = (a.getAttribute('onclick') || '').match(/getTerList\((\d+)/);
           const title = a.getAttribute('title') || '';
@@ -1610,6 +1615,16 @@ export function createCallTool(session) {
       );
 
       if (!territories.length) throw new Error('No territories found on GetStandard.php');
+
+      // Filter to a single territory if one was specified.
+      if (territory) {
+        const needle = String(territory).toLowerCase().trim();
+        territories = territories.filter(t =>
+          t.name.toLowerCase() === needle ||
+          t.name.toLowerCase().replace(/^[a-z]-/, '') === needle.replace(/^[a-z]-/, '')
+        );
+        if (!territories.length) return { success: false, message: `Territory "${territory}" not found.` };
+      }
 
       const results = [];
 
@@ -1706,7 +1721,7 @@ export function createCallTool(session) {
       case 'get_user_preferences':        return handleGetUserPreferences();
       case 'route_territory':             return handleRouteTerritory(args);
       case 'add_address':                 return handleAddAddress(args);
-      case 'gated_address_report':        return handleGatedAddressReport();
+      case 'gated_address_report':        return handleGatedAddressReport(args);
       default:
         return { error: true, message: `Unknown tool: ${name}` };
     }
