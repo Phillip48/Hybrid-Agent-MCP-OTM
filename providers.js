@@ -6,7 +6,7 @@ export const PROVIDERS = ['gemini', 'anthropic', 'openai', 'groq'];
 
 export const DEFAULT_MODELS = {
   gemini:    'gemini-2.0-flash-lite',    // free tier, 30 RPM vs 15 RPM for regular flash
-  anthropic: 'claude-sonnet-4-6',         // Sonnet 4.6
+  anthropic: 'claude-haiku-4-5-20251001', // Haiku 4.5 — cheapest Claude with tool use
   openai:    'gpt-4o-mini',             // ~15x cheaper than gpt-4o, reliable tool use
   groq:      'llama-3.3-70b-versatile', // free; smaller models are unreliable for tool use
 };
