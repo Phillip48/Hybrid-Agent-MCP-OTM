@@ -273,6 +273,11 @@ export const OTM_TOOLS = [
       required: ['street_number', 'street_name'],
     },
   },
+  {
+    name: 'gated_address_report',
+    description: 'Checks every available territory on the checkout page and returns the percentage of gated addresses in each one, sorted highest to lowest.',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
 // ── Tool implementation factory ───────────────────────────────────────────────
@@ -488,24 +493,79 @@ export function createCallTool(session) {
       const formPanel = await scrapePanel();
       console.log('[checkout] Panel after clicking Check Out:', formPanel.text.slice(0, 300));
 
-      // Step 3: Find the publisher's row and click their specific "Yes!" button.
-      // OTM shows a list of publishers each with their own "Yes!" link next to their name.
       const checkoutDate = formatDate(date);
-      const publisherResult = await session.evaluate((name) => {
+
+      // Step 3: Select the publisher and submit the checkout form.
+      //
+      // OTM has two possible checkout layouts:
+      //   A) A form with a <select id="userid"> publisher dropdown (logged-in user
+      //      is pre-selected — we MUST change this before submitting).
+      //   B) A per-publisher list of "Yes!" links (older layout, used as fallback).
+      const publisherResult = await session.evaluate((name, dateStr) => {
+        const nameLower = name.toLowerCase().trim();
+
+        // ── Layout A: publisher select dropdown ──────────────────────────────
+        const select = document.getElementById('userid');
+        if (select) {
+          const options = [...select.options];
+          // Find the best match — prefer the option whose text most closely
+          // matches the requested name. Never rely on the pre-selected value.
+          const match = options.find(o => o.textContent.toLowerCase().includes(nameLower));
+
+          if (!match) {
+            return {
+              error: `Publisher "${name}" not found in dropdown`,
+              availableOptions: options.map(o => o.textContent.trim()),
+            };
+          }
+
+          // Explicitly set the dropdown value so the pre-selected (logged-in)
+          // user is overwritten before the form is submitted.
+          select.value = match.value;
+          select.dispatchEvent(new Event('change', { bubbles: true }));
+          console.log(`[checkout] Selected publisher: ${match.textContent.trim()} (value ${match.value})`);
+
+          // Set the date if a date input exists.
+          const dateInput = document.querySelector(
+            'input[name="CheckoutDate"], input[name*="Date"], input[name*="date"], input[type="date"]'
+          );
+          if (dateInput && dateStr) {
+            dateInput.value = dateStr;
+            dateInput.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+
+          // Click the submit/confirm button.
+          const submitBtn = document.querySelector(
+            'input[type="submit"], button[type="submit"], ' +
+            'input[type="button"][value*="assign" i], input[type="button"][value*="checkout" i], ' +
+            'input[type="button"][value*="confirm" i], input[type="button"][value*="yes" i]'
+          );
+          if (submitBtn) {
+            submitBtn.click();
+            return { method: 'select_dropdown', matched: match.textContent.trim() };
+          }
+
+          // Fall back to form.submit() if no button found.
+          const form = select.closest('form');
+          if (form) {
+            form.submit();
+            return { method: 'select_dropdown_form', matched: match.textContent.trim() };
+          }
+
+          return { error: 'Publisher selected but no submit button found', matched: match.textContent.trim() };
+        }
+
+        // ── Layout B: per-publisher "Yes!" buttons ───────────────────────────
         const panel = document.getElementById('listter');
         if (!panel) return { error: 'No panel found' };
 
-        const nameLower = name.toLowerCase().trim();
-
-        // Collect all clickable "Yes!" elements in the panel.
         const yesEls = [...panel.querySelectorAll('a, button, input[type="submit"]')]
           .filter(el => /yes/i.test((el.textContent + (el.value || '')).trim()));
 
         if (yesEls.length === 0) {
-          return { error: 'No Yes! buttons found in panel', panelText: panel.innerText.slice(0, 500) };
+          return { error: 'No publisher dropdown or Yes! buttons found in panel', panelText: panel.innerText.slice(0, 500) };
         }
 
-        // For each Yes! button, read the text of the closest containing block.
         for (const el of yesEls) {
           const container = el.closest('tr, li, p, div') ?? el.parentElement;
           const containerText = (container?.innerText ?? '').toLowerCase();
@@ -515,13 +575,12 @@ export function createCallTool(session) {
           }
         }
 
-        // Name not found — return available options so the AI knows what's there.
         const options = yesEls.map(el => {
           const container = el.closest('tr, li, p, div') ?? el.parentElement;
           return (container?.innerText ?? '').trim();
         });
         return { error: `Publisher "${name}" not found in checkout list`, availableOptions: options };
-      }, publisher_name);
+      }, publisher_name, checkoutDate);
 
       console.log('[checkout] Publisher result:', JSON.stringify(publisherResult).slice(0, 300));
 
@@ -535,10 +594,14 @@ export function createCallTool(session) {
         };
       }
 
-      await session.page.waitForTimeout(2000);
+      // Wait for the form submission to complete (may navigate or update via AJAX).
+      await session.page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() =>
+        session.page.waitForTimeout(2500)
+      );
       const finalPanel = await scrapePanel();
       return {
         success: true,
+        method: publisherResult.method,
         publisherMatched: publisherResult.matched,
         date: checkoutDate,
         result: finalPanel.text.slice(0, 1000),
@@ -1527,6 +1590,82 @@ export function createCallTool(session) {
     }));
   }
 
+  async function handleGatedAddressReport() {
+    return withBrowser(async () => {
+      const page = session.page;
+
+      // Load the full territory list once.
+      await page.goto('https://onlineterritorymanager.com/GetStandard.php?code=A');
+      await page.waitForLoadState('networkidle');
+
+      // Collect every territory link from the left panel.
+      const territories = await page.evaluate(() =>
+        [...document.querySelectorAll('a[onclick*="getTerList"]')].map(a => {
+          const m     = (a.getAttribute('onclick') || '').match(/getTerList\((\d+)/);
+          const title = a.getAttribute('title') || '';
+          const name  = a.textContent.trim();
+          const desc  = title.replace(name + '-', '');
+          return m ? { id: m[1], name, desc } : null;
+        }).filter(Boolean)
+      );
+
+      if (!territories.length) throw new Error('No territories found on GetStandard.php');
+
+      const results = [];
+
+      for (const t of territories) {
+        // Trigger AJAX panel load without navigating away from the page.
+        await page.evaluate((id) => { window.getTerList(parseInt(id), 0, 0, 0); }, t.id);
+
+        // Wait for panel to contain real address data.
+        const loaded = await page.waitForFunction(
+          () => {
+            const txt = (document.getElementById('listter')?.innerText ?? '').trim();
+            return txt.length > 50 && !txt.startsWith('Please select');
+          },
+          { timeout: 10_000 }
+        ).then(() => true).catch(() => false);
+
+        if (!loaded) {
+          results.push({ name: t.name, desc: t.desc, total: 0, gated: 0, pct: 0, note: 'timeout' });
+          continue;
+        }
+
+        // Count total address rows and gated ones in the panel table.
+        const stats = await page.evaluate(() => {
+          const panel = document.getElementById('listter');
+          if (!panel) return { total: 0, gated: 0 };
+          const rows = [...panel.querySelectorAll('tbody tr')];
+          let total = 0, gated = 0;
+          for (const row of rows) {
+            const cells = row.querySelectorAll('td');
+            if (cells.length < 2) continue;
+            total++;
+            if (row.textContent.toLowerCase().includes('gated')) gated++;
+          }
+          return { total, gated };
+        });
+
+        const pct = stats.total > 0 ? Math.round((stats.gated / stats.total) * 100) : 0;
+        results.push({ name: t.name, desc: t.desc, total: stats.total, gated: stats.gated, pct });
+      }
+
+      results.sort((a, b) => b.pct - a.pct);
+
+      return {
+        success: true,
+        territories_checked: results.length,
+        results: results.map(r => ({
+          territory:  `${r.name}${r.desc ? ' — ' + r.desc : ''}`,
+          gated:      r.gated,
+          total:      r.total,
+          gated_pct:  `${r.pct}%`,
+          ...(r.note ? { note: r.note } : {}),
+        })),
+      };
+    });
+  }
+
   // ── Dispatch ────────────────────────────────────────────────────────────────
 
   return async function callTool(name, args = {}) {
@@ -1567,6 +1706,7 @@ export function createCallTool(session) {
       case 'get_user_preferences':        return handleGetUserPreferences();
       case 'route_territory':             return handleRouteTerritory(args);
       case 'add_address':                 return handleAddAddress(args);
+      case 'gated_address_report':        return handleGatedAddressReport();
       default:
         return { error: true, message: `Unknown tool: ${name}` };
     }

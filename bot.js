@@ -342,7 +342,8 @@ async function runTask(ctx, userId, task) {
 
   // Routing needs more time — Census geocoding is fast but form navigation adds overhead.
   const isRoutingTask = /\broute\b/i.test(task);
-  const TIMEOUT_MS    = isRoutingTask ? 240_000 : 75_000;
+  const isLongTask    = /\bgated\b/i.test(task);
+  const TIMEOUT_MS    = isRoutingTask ? 240_000 : isLongTask ? 120_000 : 75_000;
   const timeoutPromise = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(`Task timed out after ${TIMEOUT_MS / 1000}s. Try a simpler or more specific request.`)), TIMEOUT_MS)
   );
