@@ -1073,63 +1073,122 @@ export function createCallTool(session) {
         failed.forEach(a => console.warn(`  - ${a}`));
       }
 
-      // ── Step 6: Order via nearest-neighbor then 2-opt refinement ───────────
-      // Nearest-neighbor gives a reasonable initial route; 2-opt eliminates
-      // crossings by repeatedly reversing segments that reduce total distance.
-      // Ungeocodable addresses (no coords) are appended at the end.
+      // ── Step 6: Nearest-neighbor → 2-opt + Or-opt until stable ─────────────
+      // Nearest-neighbor builds the initial route. Then we alternate between:
+      //   2-opt   — reverses a segment when doing so removes a crossing
+      //   Or-opt  — pulls a segment of 1/2/3 addresses out and reinserts it at
+      //             the best position elsewhere (catches what 2-opt misses)
+      // Each pass returns on the first improvement found; the outer loop keeps
+      // going until all four moves come up empty (local optimum).
       const withCoords    = geocoded.filter(g => g.coords);
       const withoutCoords = geocoded.filter(g => !g.coords);
 
-      // Nearest-neighbor pass
-      const ordered   = [];
-      let   current   = { lat: HOME_LAT, lon: HOME_LON };
-      const unvisited = [...withCoords];
-
-      while (unvisited.length > 0) {
-        let nearestIdx  = 0;
-        let nearestDist = Infinity;
-        for (let i = 0; i < unvisited.length; i++) {
-          const d = haversineKm(current.lat, current.lon, unvisited[i].coords.lat, unvisited[i].coords.lon);
-          if (d < nearestDist) { nearestDist = d; nearestIdx = i; }
+      // Nearest-neighbor initial solution
+      const nnOrdered = [];
+      let   nnCurrent = { lat: HOME_LAT, lon: HOME_LON };
+      const nnPool    = [...withCoords];
+      while (nnPool.length > 0) {
+        let bestIdx = 0, bestDist = Infinity;
+        for (let i = 0; i < nnPool.length; i++) {
+          const d = haversineKm(nnCurrent.lat, nnCurrent.lon, nnPool[i].coords.lat, nnPool[i].coords.lon);
+          if (d < bestDist) { bestDist = d; bestIdx = i; }
         }
-        const next = unvisited.splice(nearestIdx, 1)[0];
-        ordered.push(next);
-        current = next.coords;
+        const next = nnPool.splice(bestIdx, 1)[0];
+        nnOrdered.push(next);
+        nnCurrent = next.coords;
       }
 
-      // 2-opt refinement — eliminates route crossings for an open path.
-      // For each pair of edges, try reversing the segment between them;
-      // keep the reversal if it shortens the total path.
-      function twoOpt(route) {
+      // Shared helpers — all moves use the open-path model (start = home, no return).
+      const H = { lat: HOME_LAT, lon: HOME_LON };
+      const dc = (a, b) => haversineKm(a.lat, a.lon, b.lat, b.lon);
+      const coord = (node) => node.coords;
+      const prev  = (route, i) => i === 0 ? H : coord(route[i - 1]);
+      const next  = (route, i) => i === route.length - 1 ? null : coord(route[i + 1]);
+
+      // Single 2-opt pass — returns {route, improved} on first improving swap.
+      function twoOptPass(route) {
         const n = route.length;
-        let improved = true;
-        while (improved) {
-          improved = false;
-          for (let i = 0; i < n - 1; i++) {
-            for (let j = i + 1; j < n; j++) {
-              const prevI = i === 0 ? { lat: HOME_LAT, lon: HOME_LON } : route[i - 1].coords;
-              const nextJ = j === n - 1 ? null : route[j + 1].coords;
+        for (let i = 0; i < n - 1; i++) {
+          for (let j = i + 1; j < n; j++) {
+            const pI = prev(route, i);
+            const nJ = j < n - 1 ? coord(route[j + 1]) : null;
+            const before = dc(pI, coord(route[i])) + (nJ ? dc(coord(route[j]), nJ) : 0);
+            const after  = dc(pI, coord(route[j])) + (nJ ? dc(coord(route[i]), nJ) : 0);
+            if (after < before - 1e-9) {
+              return {
+                route: [...route.slice(0, i), ...route.slice(i, j + 1).reverse(), ...route.slice(j + 1)],
+                improved: true,
+              };
+            }
+          }
+        }
+        return { route, improved: false };
+      }
 
-              const costBefore =
-                haversineKm(prevI.lat, prevI.lon, route[i].coords.lat, route[i].coords.lon) +
-                (nextJ ? haversineKm(route[j].coords.lat, route[j].coords.lon, nextJ.lat, nextJ.lon) : 0);
+      // Single Or-opt pass for segments of length segLen.
+      // Tries each segment in every insertion position (including reversed).
+      // Returns {route, improved} on first improving move.
+      function orOptPass(route, segLen) {
+        const n = route.length;
+        if (n <= segLen + 1) return { route, improved: false };
 
-              const costAfter =
-                haversineKm(prevI.lat, prevI.lon, route[j].coords.lat, route[j].coords.lon) +
-                (nextJ ? haversineKm(route[i].coords.lat, route[i].coords.lon, nextJ.lat, nextJ.lon) : 0);
+        for (let i = 0; i <= n - segLen; i++) {
+          const seg   = route.slice(i, i + segLen);
+          const pI    = prev(route, i);
+          const nI    = i + segLen < n ? coord(route[i + segLen]) : null;
 
-              if (costAfter < costBefore - 1e-9) {
-                route = [...route.slice(0, i), ...route.slice(i, j + 1).reverse(), ...route.slice(j + 1)];
-                improved = true;
+          // Cost saved by removing the segment from its current position.
+          const removeSaving =
+            dc(pI, coord(seg[0])) +
+            (nI ? dc(coord(seg[segLen - 1]), nI) - dc(pI, nI) : 0);
+
+          const without = [...route.slice(0, i), ...route.slice(i + segLen)];
+          const m = without.length;
+
+          for (let j = 0; j <= m; j++) {
+            const pJ = j === 0 ? H : coord(without[j - 1]);
+            const nJ = j < m ? coord(without[j]) : null;
+            const edgeBefore = nJ ? dc(pJ, nJ) : 0;
+
+            // Try inserting segment in forward and reversed orientations.
+            for (const s of [seg, segLen > 1 ? [...seg].reverse() : null]) {
+              if (!s) continue;
+              const insertCost =
+                dc(pJ, coord(s[0])) +
+                (nJ ? dc(coord(s[segLen - 1]), nJ) - edgeBefore : 0);
+
+              if (removeSaving - insertCost > 1e-9) {
+                return {
+                  route: [...without.slice(0, j), ...s, ...without.slice(j)],
+                  improved: true,
+                };
               }
             }
           }
         }
-        return route;
+        return { route, improved: false };
       }
 
-      const refined = twoOpt(ordered);
-      console.log(`[route] 2-opt complete — ${refined.length} addresses optimized`);
+      // Drive convergence: alternate moves until none improves the route.
+      let refined = nnOrdered;
+      let totalIter = 0;
+      {
+        let anyImproved = true;
+        while (anyImproved && totalIter < 500) {
+          anyImproved = false;
+          totalIter++;
+          for (const move of [
+            (r) => twoOptPass(r),
+            (r) => orOptPass(r, 1),
+            (r) => orOptPass(r, 2),
+            (r) => orOptPass(r, 3),
+          ]) {
+            const { route: r, improved } = move(refined);
+            if (improved) { refined = r; anyImproved = true; break; }
+          }
+        }
+      }
+      console.log(`[route] Optimization complete — ${totalIter} iterations, ${refined.length} addresses`);
 
       const sorted    = [...refined, ...withoutCoords];
       const sortedIds = sorted.map(g => g.id);
