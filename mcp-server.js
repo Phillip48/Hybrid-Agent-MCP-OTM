@@ -1085,21 +1085,65 @@ export function createCallTool(session) {
       const dc = (a, b) => haversineKm(a.lat, a.lon, b.lat, b.lon);
       const coord = (node) => node.coords;
 
-      // Build a nearest-neighbor route starting from any coordinate.
+      // Cluster-aware lookahead nearest-neighbor.
+      // At each step, considers the K nearest candidates and scores each by:
+      //   1. Direct distance to candidate          (minimize travel now)
+      //   2. Nearest remaining address after it    (1-step lookahead)
+      //   3. Cluster density around candidate      (bonus for sweeping dense areas)
+      // This prevents the greedy algorithm from picking an isolated address when
+      // a slightly-farther candidate unlocks a whole neighbourhood nearby.
       function nnRoute(nodes, startCoord) {
+        const K           = 10;   // candidates evaluated at each step
+        const RADIUS      = 0.35; // km — neighbourhood cluster radius (~3-4 blocks)
+        const LOOKAHEAD_W = 0.5;  // weight on 2nd-step cost (0=ignore, 1=equal weight)
+
         const ordered = [];
         let cur = startCoord;
         const pool = [...nodes];
+
         while (pool.length > 0) {
-          let bestIdx = 0, bestDist = Infinity;
-          for (let i = 0; i < pool.length; i++) {
-            const d = dc(cur, coord(pool[i]));
-            if (d < bestDist) { bestDist = d; bestIdx = i; }
+          if (pool.length === 1) { ordered.push(pool.splice(0, 1)[0]); break; }
+
+          // Pick K nearest candidates from current position.
+          const candidates = pool
+            .map((node, idx) => ({ node, idx, dist: dc(cur, coord(node)) }))
+            .sort((a, b) => a.dist - b.dist)
+            .slice(0, Math.min(K, pool.length));
+
+          let bestScore = Infinity;
+          let bestIdx   = candidates[0].idx;
+
+          for (const { node: cNode, idx: cIdx, dist: cDist } of candidates) {
+            // Cluster bonus: count unvisited addresses within RADIUS of this candidate.
+            let clusterSize = 0;
+            for (let i = 0; i < pool.length; i++) {
+              if (i !== cIdx && dc(coord(pool[i]), coord(cNode)) <= RADIUS) clusterSize++;
+            }
+
+            // 1-step lookahead: nearest remaining address after visiting this candidate.
+            let nearestAfter = 0;
+            if (pool.length > 1) {
+              nearestAfter = Infinity;
+              for (let i = 0; i < pool.length; i++) {
+                if (i !== cIdx) {
+                  const d = dc(coord(cNode), coord(pool[i]));
+                  if (d < nearestAfter) nearestAfter = d;
+                }
+              }
+            }
+
+            // Cluster bonus capped at 50% of direct distance so we never travel
+            // far just to find a dense cluster on the other side of the territory.
+            const clusterBonus = Math.min(clusterSize * RADIUS * 0.4, cDist * 0.5);
+            const score = cDist + LOOKAHEAD_W * nearestAfter - clusterBonus;
+
+            if (score < bestScore) { bestScore = score; bestIdx = cIdx; }
           }
-          const n = pool.splice(bestIdx, 1)[0];
-          ordered.push(n);
-          cur = coord(n);
+
+          ordered.push(pool.splice(bestIdx, 1)[0]);
+          cur = coord(ordered[ordered.length - 1]);
         }
+
         return ordered;
       }
 
