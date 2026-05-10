@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 import 'dotenv/config';
 import { fileURLToPath } from 'url';
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
-import { join } from 'path';
+import { readFileSync, writeFileSync } from 'fs';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
@@ -272,21 +271,6 @@ export const OTM_TOOLS = [
         confirmed:     { type: 'boolean', description: 'Mark the address as confirmed. Default false.' },
       },
       required: ['street_number', 'street_name'],
-    },
-  },
-  {
-    name: 'auto_assign_addresses',
-    description: 'Selects all territories on AutoAssignAdmin.php and runs auto-assign to move new addresses (from the NA-New Addresses system territory) into their correct territories based on map regions. Uses the "Reassign New Addresses Only" option by default.',
-    inputSchema: { type: 'object', properties: {} },
-  },
-  {
-    name: 'backup_otm',
-    description: 'Downloads all three OTM backup files (Addresses, Territory, Routing) and saves them locally in a BACKUP_<congregation> folder named with the congregation name and today\'s date.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        congregation_name: { type: 'string', description: 'Congregation name to use for the folder/file names. If omitted, it is fetched from GroupPref.php.' },
-      },
     },
   },
 ];
@@ -1315,85 +1299,6 @@ export function createCallTool(session) {
     });
   }
 
-  async function handleAutoAssignAddresses() {
-    return withBrowser(async () => {
-      const page = session.page;
-
-      await page.goto('https://onlineterritorymanager.com/AutoAssignAdmin.php');
-      await page.waitForLoadState('networkidle');
-
-      // Select every territory in the multi-select list.
-      const optionCount = await page.evaluate(() => {
-        const select = document.querySelector('#TerSel');
-        if (!select) return 0;
-        Array.from(select.options).forEach(opt => { opt.selected = true; });
-        return select.options.length;
-      });
-
-      if (optionCount === 0) throw new Error('Territory list (#TerSel) not found on AutoAssignAdmin.php');
-
-      // Ensure "Reassign New Addresses Only" is checked (it is by default, but be explicit).
-      const isChecked = await page.isChecked('#chkOnlyNew');
-      if (!isChecked) await page.check('#chkOnlyNew');
-
-      // Click Auto Assign — this triggers an AJAX call via runAssign('assignit').
-      await page.click('#AutoAsgn');
-
-      // Wait for the results div to be populated (up to 60s for large territory lists).
-      await page.waitForFunction(
-        () => (document.querySelector('#results')?.innerText ?? '').trim().length > 0,
-        { timeout: 60_000 },
-      );
-
-      const result  = await page.evaluate(() => document.querySelector('#results')?.innerText?.trim() ?? '');
-      const msgbox  = await page.evaluate(() => document.querySelector('#msgbox')?.innerText?.trim() ?? '');
-
-      return { success: true, territories_selected: optionCount, result, msgbox: msgbox || undefined };
-    });
-  }
-
-  async function handleBackupOTM({ congregation_name } = {}) {
-    return withBrowser(async () => {
-      const page = session.page;
-
-      // Use provided name or fetch it from the preferences page.
-      let congName = congregation_name?.trim();
-      if (!congName) {
-        await page.goto('https://onlineterritorymanager.com/GroupPref.php');
-        await page.waitForLoadState('networkidle');
-        congName = await page.inputValue('#GroupDescr');
-        if (!congName) throw new Error('Could not read congregation name from GroupPref.php');
-      }
-
-      // Build folder + file name prefix
-      const safeName = congName.replace(/[/\\:*?"<>|]/g, '-').trim();
-      const date = new Date().toISOString().split('T')[0];
-      const folderName = `BACKUP_${safeName}`;
-      const backupDir = join(process.cwd(), folderName);
-      if (!existsSync(backupDir)) mkdirSync(backupDir, { recursive: true });
-
-      // Download each backup file
-      const backups = [
-        { what: 'A', label: 'Addresses' },
-        { what: 'T', label: 'Territory' },
-        { what: 'R', label: 'Routing' },
-      ];
-
-      const saved = [];
-      for (const { what, label } of backups) {
-        const [download] = await Promise.all([
-          page.waitForEvent('download'),
-          page.goto(`https://onlineterritorymanager.com/Backup.php?what=${what}`),
-        ]);
-        const filename = `${safeName}_${date}_${label}.csv`;
-        await download.saveAs(join(backupDir, filename));
-        saved.push(filename);
-      }
-
-      return { success: true, congregation: congName, folder: folderName, files: saved };
-    });
-  }
-
   async function handleGetPageContent() {
     return withBrowser(async () => {
       const url  = await session.getCurrentUrl();
@@ -1453,8 +1358,6 @@ export function createCallTool(session) {
       case 'get_user_preferences':        return handleGetUserPreferences();
       case 'route_territory':             return handleRouteTerritory(args);
       case 'add_address':                 return handleAddAddress(args);
-      case 'auto_assign_addresses':       return handleAutoAssignAddresses();
-      case 'backup_otm':                  return handleBackupOTM(args);
       default:
         return { error: true, message: `Unknown tool: ${name}` };
     }

@@ -91,9 +91,8 @@ export async function setUser(userId, fields) {
   if ('allowed'     in fields) updated.allowed     = fields.allowed;
   if ('registered'  in fields) updated.registered  = fields.registered;
   if ('displayName' in fields) updated.displayName = fields.displayName;
-  if ('provider'         in fields) updated.provider         = fields.provider;
-  if ('model'            in fields) updated.model            = fields.model;
-  if ('congregationName' in fields) updated.congregationName = fields.congregationName;
+  if ('provider'    in fields) updated.provider    = fields.provider;
+  if ('model'       in fields) updated.model       = fields.model;
 
   store[id] = updated;
   await writeStore(store);
