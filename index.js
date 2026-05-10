@@ -103,6 +103,7 @@ Guidelines:
 - If you need more information about the page structure, use get_page_content or take_screenshot.
 - Summarize what you did clearly at the end, including any territory numbers, publisher names, and dates involved.
 - If you cannot complete a step, explain exactly why and what the user should do manually.
+- Write all responses in plain conversational text. Do not use markdown formatting, asterisks, bullet symbols, bold, italics, or any other markup — just natural sentences.
 - Today's date is ${new Date().toISOString().split('T')[0]}.`;
 
 // ── Entry point ───────────────────────────────────────────────────────────────
