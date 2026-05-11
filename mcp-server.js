@@ -1619,10 +1619,7 @@ export function createCallTool(session) {
       // Filter to a single territory if one was specified.
       if (territory) {
         const needle = String(territory).toLowerCase().trim();
-        territories = territories.filter(t =>
-          t.name.toLowerCase() === needle ||
-          t.name.toLowerCase().replace(/^[a-z]-/, '') === needle.replace(/^[a-z]-/, '')
-        );
+        territories = territories.filter(t => t.name.toLowerCase() === needle);
         if (!territories.length) return { success: false, message: `Territory "${territory}" not found.` };
       }
 
