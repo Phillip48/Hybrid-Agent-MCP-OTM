@@ -1653,27 +1653,44 @@ export function createCallTool(session) {
           continue;
         }
 
-        // Select the territory and submit.
+        // Select the territory and submit — use Promise.all to catch immediate navigation.
         await page.selectOption('#ternum', optionValue);
-        await page.click('#Search');
-        await page.waitForLoadState('networkidle');
+        await Promise.all([
+          page.waitForLoadState('networkidle'),
+          page.click('#Search'),
+        ]);
 
         // Find the LG/Dog column and count "Yes" rows in the results table.
-        const gated = await page.evaluate(() => {
+        // Uses all rows except the first (header) to handle tables with no explicit tbody.
+        // Normalises whitespace so <br> inside headers doesn't break matching.
+        const { gated, debugInfo } = await page.evaluate(() => {
           for (const table of document.querySelectorAll('table')) {
-            const headerRow = table.querySelector('tr');
-            if (!headerRow) continue;
-            const headers = [...headerRow.querySelectorAll('th, td')].map(h => h.textContent.trim());
-            const lgDogIdx = headers.findIndex(h => /LG.{0,3}Dog/i.test(h));
-            if (lgDogIdx === -1) continue;
+            const allRows = [...table.querySelectorAll('tr')];
+            if (allRows.length < 2) continue;
 
-            return [...table.querySelectorAll('tbody tr')].filter(row => {
+            const headers = [...allRows[0].querySelectorAll('th, td')]
+              .map(h => h.textContent.replace(/[\s\n\r]+/g, ' ').trim());
+            const lgDogIdx = headers.findIndex(h => /LG.{0,5}Dog/i.test(h));
+            if (lgDogIdx < 0) continue;
+
+            const dataRows = allRows.slice(1);
+            const values = dataRows.map(row => {
               const cell = row.querySelectorAll('td')[lgDogIdx];
-              return cell?.textContent.trim().toLowerCase() === 'yes';
-            }).length;
+              return (cell?.textContent ?? '').trim();
+            });
+
+            const uniqueValues = {};
+            for (const v of values) uniqueValues[v] = (uniqueValues[v] ?? 0) + 1;
+
+            return {
+              gated: values.filter(v => v.toLowerCase() === 'yes').length,
+              debugInfo: { headers, lgDogIdx, totalRows: dataRows.length, uniqueValues },
+            };
           }
-          return 0;
+          return { gated: 0, debugInfo: { headers: null, lgDogIdx: -1, totalRows: 0, uniqueValues: {} } };
         });
+
+        console.log(`[gated_report] ${t.name}: ${JSON.stringify(debugInfo)}, gated=${gated}`);
 
         const pct = t.total > 0 ? Math.round((gated / t.total) * 100) : 0;
         results.push({ name: t.name, desc: t.desc, total: t.total, gated, pct });
