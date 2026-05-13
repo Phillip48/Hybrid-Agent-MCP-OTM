@@ -1603,16 +1603,29 @@ export function createCallTool(session) {
       await page.goto('https://onlineterritorymanager.com/GetStandard.php?code=A');
       await page.waitForLoadState('networkidle');
 
-      // Collect every territory link from the left panel.
-      let territories = await page.evaluate(() =>
-        [...document.querySelectorAll('a[onclick*="getTerList"]')].map(a => {
-          const m     = (a.getAttribute('onclick') || '').match(/getTerList\((\d+)/);
-          const title = a.getAttribute('title') || '';
-          const name  = a.textContent.trim();
+      // Collect territory links AND their #Addrs counts from the left-panel table.
+      // #Addrs is the 4th column (index 3) of the main territory list — no AJAX needed.
+      let territories = await page.evaluate(() => {
+        const table = document.querySelector('table.table');
+        if (!table) return [];
+        // Locate #Addrs column index from the header row.
+        const headerCells = [...(table.querySelector('thead tr')?.querySelectorAll('th') ?? [])];
+        const addrsColIdx = headerCells.findIndex(
+          th => th.textContent.includes('#') && th.textContent.includes('Addrs')
+        );
+        return [...table.querySelectorAll('tbody tr')].map(row => {
+          const link = row.querySelector('a[onclick*="getTerList"]');
+          if (!link) return null;
+          const m     = (link.getAttribute('onclick') || '').match(/getTerList\((\d+)/);
+          const title = link.getAttribute('title') || '';
+          const name  = link.textContent.trim();
           const desc  = title.replace(name + '-', '');
-          return m ? { id: m[1], name, desc } : null;
-        }).filter(Boolean)
-      );
+          const cells = [...row.querySelectorAll('td')];
+          const addrsCell = addrsColIdx >= 0 ? cells[addrsColIdx] : cells[3];
+          const total = parseInt(addrsCell?.textContent.trim() || '0', 10);
+          return m ? { id: m[1], name, desc, total: isNaN(total) ? 0 : total } : null;
+        }).filter(Boolean);
+      });
 
       if (!territories.length) throw new Error('No territories found on GetStandard.php');
 
@@ -1639,44 +1652,38 @@ export function createCallTool(session) {
         ).then(() => true).catch(() => false);
 
         if (!loaded) {
-          results.push({ name: t.name, desc: t.desc, total: 0, gated: 0, pct: 0, note: 'timeout' });
+          results.push({ name: t.name, desc: t.desc, total: t.total, gated: 0, pct: 0, note: 'timeout' });
           continue;
         }
 
-        // Read #Addrs (total) and LG/Dog (gated) from the territory stats panel.
-        const stats = await page.evaluate(() => {
+        // Read LG/Dog (gated) from the right panel. Total comes from the left-panel table above.
+        const gated = await page.evaluate(() => {
           const panel = document.getElementById('listter');
-          if (!panel) return { total: 0, gated: 0 };
+          if (!panel) return 0;
 
-          // Find a table whose header row contains #Addrs and/or LG/Dog columns.
+          // Find a table with a LG/Dog column header.
           for (const table of panel.querySelectorAll('table')) {
             const headerRow = table.querySelector('tr');
             if (!headerRow) continue;
             const headers = [...headerRow.querySelectorAll('th, td')].map(h => h.textContent.trim());
-            const addrsIdx = headers.findIndex(h => h.includes('#Addrs'));
-            const lgDogIdx = headers.findIndex(h => /LG\s*[/\\]\s*Dog/i.test(h));
-            if (addrsIdx === -1 && lgDogIdx === -1) continue;
-
+            const lgDogIdx = headers.findIndex(h => /LG.{0,3}Dog/i.test(h));
+            if (lgDogIdx === -1) continue;
             const dataRow = [...table.querySelectorAll('tr')][1];
             if (!dataRow) continue;
             const cells = [...dataRow.querySelectorAll('td, th')];
-            const total = addrsIdx !== -1 ? parseInt(cells[addrsIdx]?.textContent.trim() || '0', 10) : 0;
-            const gated = lgDogIdx !== -1 ? parseInt(cells[lgDogIdx]?.textContent.trim() || '0', 10) : 0;
-            return { total: isNaN(total) ? 0 : total, gated: isNaN(gated) ? 0 : gated };
+            const val = parseInt(cells[lgDogIdx]?.textContent.trim() || '0', 10);
+            return isNaN(val) ? 0 : val;
           }
 
-          // Fallback: scan text content for labelled values.
+          // Fallback: regex scan of visible text.
           const text = panel.innerText || '';
-          let total = 0, gated = 0;
-          const addrsM = text.match(/(\d+)\s*#Addrs|#Addrs\D{0,5}(\d+)/i);
-          if (addrsM) total = parseInt(addrsM[1] ?? addrsM[2], 10);
-          const lgM    = text.match(/(\d+)\s*LG\s*[/\\]\s*Dog|LG\s*[/\\]\s*Dog\D{0,5}(\d+)/i);
-          if (lgM)    gated = parseInt(lgM[1] ?? lgM[2], 10);
-          return { total: isNaN(total) ? 0 : total, gated: isNaN(gated) ? 0 : gated };
+          const m = text.match(/LG.{0,5}Dog\D{0,10}?(\d+)|(\d+)\s*LG.{0,5}Dog/i);
+          if (m) { const v = parseInt(m[1] ?? m[2], 10); return isNaN(v) ? 0 : v; }
+          return 0;
         });
 
-        const pct = stats.total > 0 ? Math.round((stats.gated / stats.total) * 100) : 0;
-        results.push({ name: t.name, desc: t.desc, total: stats.total, gated: stats.gated, pct });
+        const pct = t.total > 0 ? Math.round((gated / t.total) * 100) : 0;
+        results.push({ name: t.name, desc: t.desc, total: t.total, gated, pct });
       }
 
       results.sort((a, b) => b.pct - a.pct);
