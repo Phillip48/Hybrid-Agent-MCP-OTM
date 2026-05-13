@@ -1712,11 +1712,31 @@ export function createCallTool(session) {
     return withBrowser(async () => {
       await session.navigate(PAGES.autoAssign);
 
-      // Select every option in the territory multi-select.
+      // Select every option in the territory multi-select AND explicitly set
+      // the required options regardless of any prior page state.
       const territoryCount = await session.evaluate(() => {
         const sel = document.getElementById('TerSel');
         if (!sel) return 0;
         [...sel.options].forEach(o => { o.selected = true; });
+
+        // Step 1: All Addresses (busres = "A")
+        const allAddresses = document.querySelector('input[name="busres"][value="A"]');
+        if (allAddresses) allAddresses.checked = true;
+
+        // Step 2 Option 1: Reassign New Addresses Only — checked
+        const chkOnlyNew = document.getElementById('chkOnlyNew');
+        if (chkOnlyNew) chkOnlyNew.checked = true;
+
+        // All other Step 2 options — explicitly unchecked
+        const chkEmptyFirst = document.getElementById('chkEmptyFirst');
+        if (chkEmptyFirst) chkEmptyFirst.checked = false;
+        const chkAll = document.getElementById('chkAll');
+        if (chkAll) chkAll.checked = false;
+        const chkCnfOnly = document.getElementById('chkCnfOnly');
+        if (chkCnfOnly) chkCnfOnly.checked = false;
+        const chkNonCnfOnly = document.getElementById('chkNonCnfOnly');
+        if (chkNonCnfOnly) chkNonCnfOnly.checked = false;
+
         return sel.options.length;
       });
 
