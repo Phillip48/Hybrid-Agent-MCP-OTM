@@ -53,8 +53,7 @@ function openAIHistoryToAnthropic(history) {
       const content = [];
       if (msg.content) content.push({ type: 'text', text: msg.content });
       for (const tc of (msg.tool_calls ?? [])) {
-        let input = {};
-        try { input = JSON.parse(tc.function?.arguments || '{}'); } catch {}
+        const input = parseToolArgs(tc.function?.arguments);
         content.push({ type: 'tool_use', id: tc.id, name: tc.function.name, input });
       }
       if (content.length === 0) content.push({ type: 'text', text: '' });
@@ -76,6 +75,19 @@ function openAIHistoryToAnthropic(history) {
     }
   }
   return result;
+}
+
+// Safely parse tool arguments that may arrive as a JSON string OR already as an object.
+// Always returns a plain object so Anthropic's API doesn't reject input.
+function parseToolArgs(args) {
+  if (!args) return {};
+  if (typeof args === 'object' && !Array.isArray(args)) return args;
+  try {
+    const parsed = JSON.parse(args);
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 function truncate(text, max = 8000) {
@@ -204,7 +216,7 @@ async function geminiLoop({ task, model, systemPrompt, tools, callTool, onText, 
       const pending = toolCalls.map((tc) => ({
         id: tc.id,
         name: tc.function.name,
-        input: JSON.parse(tc.function.arguments || '{}'),
+        input: parseToolArgs(tc.function.arguments),
       }));
 
       const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
@@ -259,7 +271,7 @@ async function openaiLoop({ task, model, systemPrompt, tools, callTool, onText, 
       const pending = toolCalls.map((tc) => ({
         id: tc.id,
         name: tc.function.name,
-        input: JSON.parse(tc.function.arguments || '{}'),
+        input: parseToolArgs(tc.function.arguments),
       }));
 
       const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
@@ -308,7 +320,7 @@ async function groqLoop({ task, model, systemPrompt, tools, callTool, onText, on
       const pending = toolCalls.map((tc) => ({
         id: tc.id,
         name: tc.function.name,
-        input: JSON.parse(tc.function.arguments || '{}'),
+        input: parseToolArgs(tc.function.arguments),
       }));
 
       const results = await executeToolCalls(pending, callTool, onToolCall, onToolResult, recentTools);
