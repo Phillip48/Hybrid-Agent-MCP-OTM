@@ -1656,29 +1656,25 @@ export function createCallTool(session) {
           continue;
         }
 
-        // Read LG/Dog (gated) from the right panel. Total comes from the left-panel table above.
+        // Count rows where LG/Dog column = "Yes". Total comes from the left-panel table above.
         const gated = await page.evaluate(() => {
           const panel = document.getElementById('listter');
           if (!panel) return 0;
 
-          // Find a table with a LG/Dog column header.
           for (const table of panel.querySelectorAll('table')) {
             const headerRow = table.querySelector('tr');
             if (!headerRow) continue;
             const headers = [...headerRow.querySelectorAll('th, td')].map(h => h.textContent.trim());
             const lgDogIdx = headers.findIndex(h => /LG.{0,3}Dog/i.test(h));
             if (lgDogIdx === -1) continue;
-            const dataRow = [...table.querySelectorAll('tr')][1];
-            if (!dataRow) continue;
-            const cells = [...dataRow.querySelectorAll('td, th')];
-            const val = parseInt(cells[lgDogIdx]?.textContent.trim() || '0', 10);
-            return isNaN(val) ? 0 : val;
-          }
 
-          // Fallback: regex scan of visible text.
-          const text = panel.innerText || '';
-          const m = text.match(/LG.{0,5}Dog\D{0,10}?(\d+)|(\d+)\s*LG.{0,5}Dog/i);
-          if (m) { const v = parseInt(m[1] ?? m[2], 10); return isNaN(v) ? 0 : v; }
+            // Count data rows where the LG/Dog cell says "Yes".
+            const dataRows = [...table.querySelectorAll('tbody tr')];
+            return dataRows.filter(row => {
+              const cell = row.querySelectorAll('td')[lgDogIdx];
+              return cell?.textContent.trim().toLowerCase() === 'yes';
+            }).length;
+          }
           return 0;
         });
 
