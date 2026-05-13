@@ -300,6 +300,7 @@ export function createCallTool(session) {
 
   const PAGES = {
     // Territory checkout
+    standard:         '/GetStandard.php',
     all:              '/GetStandard.php?code=A',
     available:        '/GetStandard.php?code=B',
     checkedOut:       '/MyTer.php?showallmyter=1&sort=1',
@@ -465,147 +466,146 @@ export function createCallTool(session) {
 
   async function handleCheckoutTerritory({ territory_number, publisher_name, date }) {
     return withBrowser(async () => {
-      // Step 1: Load territory into right panel.
-      console.log(`[checkout] Loading territory ${territory_number}`);
-      const panel = await loadPanel(territory_number);
+      // Step 1: Navigate to Territory Checkout > Standard (header nav).
+      // Only available territories appear here — if the territory is absent it is
+      // already checked out or does not exist.
+      console.log(`[checkout] Navigating to Standard checkout page`);
+      await session.navigate(PAGES.standard);
 
-      // Step 2: Click the Check Out button.
-      console.log('[checkout] Clicking Check Out button');
-      const checkoutClicked = await clickInPanel('check out');
-      if (!checkoutClicked) {
-        // Territory has no CHECK OUT button — it is already checked out.
-        // Look up who has it so we can return a useful error.
-        console.log('[checkout] No checkout button — checking who has it');
-        await session.navigate(PAGES.checkedOut);
-        const holder = await session.evaluate((num) => {
-          const re   = new RegExp(num.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
-          const rows = [...document.querySelectorAll('table tbody tr')];
-          const row  = rows.find(r => re.test(r.textContent));
-          return row ? row.innerText.replace(/\s+/g, ' ').trim() : null;
-        }, territory_number);
-
+      // Step 2: Confirm the territory is in the available list.
+      const id = await findTerritoryId(territory_number);
+      if (!id) {
         return {
           error: true,
-          already_checked_out: true,
-          message: holder
-            ? `Territory ${territory_number} is already checked out. Details: ${holder}`
-            : `Territory ${territory_number} is not available for checkout (no Check Out button found in the panel).`,
+          available: false,
+          message: `Territory ${territory_number} is not in the available list — it may already be checked out or the number is incorrect.`,
         };
       }
 
-      // Wait for the checkout form to appear.
+      // Step 3: Click the territory link to load it in the right panel.
+      console.log(`[checkout] Clicking territory ${territory_number} (id=${id})`);
+      await session.page.locator(`a[onclick*="getTerList(${id}"]`).click({ timeout: 5000 });
+      await session.page.waitForFunction(
+        () => {
+          const t = (document.getElementById('listter')?.innerText ?? '').trim();
+          return t.length > 30 && !t.startsWith('Please select');
+        },
+        { timeout: 10000 }
+      ).catch(() => {});
+
+      // Step 4: Click the "Check Out" button in the panel.
+      console.log('[checkout] Clicking Check Out button in panel');
+      const checkoutClicked = await clickInPanel('check out');
+      if (!checkoutClicked) {
+        const panelText = (await scrapePanel()).text;
+        return {
+          error: true,
+          message: `Territory ${territory_number} was found on the Standard page but has no Check Out button. Panel: ${panelText.slice(0, 300)}`,
+        };
+      }
+
+      // Wait for the publisher selection form to appear.
       await session.page.waitForTimeout(1500);
       const formPanel = await scrapePanel();
-      console.log('[checkout] Panel after clicking Check Out:', formPanel.text.slice(0, 300));
+      console.log('[checkout] Publisher form panel:', formPanel.text.slice(0, 300));
 
       const checkoutDate = formatDate(date);
 
-      // Step 3: Select the publisher and submit the checkout form.
+      // Step 5: Select the publisher from the list/dropdown and click Yes.
       //
-      // OTM has two possible checkout layouts:
-      //   A) A form with a <select id="userid"> publisher dropdown (logged-in user
-      //      is pre-selected — we MUST change this before submitting).
-      //   B) A per-publisher list of "Yes!" links (older layout, used as fallback).
+      // OTM has two layouts after clicking Check Out:
+      //   A) A <select id="userid"> dropdown + Yes/Submit button.
+      //   B) A per-publisher list with individual "Yes!" links beside each name.
       const publisherResult = await session.evaluate((name, dateStr) => {
         const nameLower = name.toLowerCase().trim();
+        const panel = document.getElementById('listter');
+        if (!panel) return { error: 'No panel (#listter) found after clicking Check Out' };
 
-        // ── Layout A: publisher select dropdown ──────────────────────────────
-        const select = document.getElementById('userid');
+        // ── Layout A: publisher <select> dropdown ────────────────────────────
+        const select = panel.querySelector('select#userid') ?? document.getElementById('userid');
         if (select) {
           const options = [...select.options];
-          // Find the best match — prefer the option whose text most closely
-          // matches the requested name. Never rely on the pre-selected value.
           const match = options.find(o => o.textContent.toLowerCase().includes(nameLower));
-
           if (!match) {
-            return {
-              error: `Publisher "${name}" not found in dropdown`,
-              availableOptions: options.map(o => o.textContent.trim()),
-            };
+            return { error: `Publisher "${name}" not found in dropdown`, availableOptions: options.map(o => o.textContent.trim()) };
           }
 
-          // Explicitly set the dropdown value so the pre-selected (logged-in)
-          // user is overwritten before the form is submitted.
           select.value = match.value;
           select.dispatchEvent(new Event('change', { bubbles: true }));
-          console.log(`[checkout] Selected publisher: ${match.textContent.trim()} (value ${match.value})`);
 
-          // Set the date if a date input exists.
-          const dateInput = document.querySelector(
-            'input[name="CheckoutDate"], input[name*="Date"], input[name*="date"], input[type="date"]'
-          );
+          const dateInput = panel.querySelector('input[name*="Date"], input[name*="date"], input[type="date"]')
+            ?? document.querySelector('input[name="CheckoutDate"], input[name*="Date"]');
           if (dateInput && dateStr) {
             dateInput.value = dateStr;
             dateInput.dispatchEvent(new Event('change', { bubbles: true }));
           }
 
-          // Click the submit/confirm button.
-          const submitBtn = document.querySelector(
-            'input[type="submit"], button[type="submit"], ' +
-            'input[type="button"][value*="assign" i], input[type="button"][value*="checkout" i], ' +
-            'input[type="button"][value*="confirm" i], input[type="button"][value*="yes" i]'
-          );
-          if (submitBtn) {
-            submitBtn.click();
+          // Click the Yes / confirm button.
+          const yesBtn = [...(panel.querySelectorAll('a, button, input[type="submit"], input[type="button"]'))]
+            .find(el => /yes/i.test(el.textContent.trim() + (el.value ?? '')));
+          if (yesBtn) {
+            yesBtn.click();
             return { method: 'select_dropdown', matched: match.textContent.trim() };
           }
-
-          // Fall back to form.submit() if no button found.
           const form = select.closest('form');
-          if (form) {
-            form.submit();
-            return { method: 'select_dropdown_form', matched: match.textContent.trim() };
+          if (form) { form.submit(); return { method: 'select_dropdown_form', matched: match.textContent.trim() }; }
+          return { error: 'Publisher selected but no Yes button found', matched: match.textContent.trim() };
+        }
+
+        // ── Layout B: per-publisher "Yes!" links beside each name ────────────
+        const rows = [...panel.querySelectorAll('tr')];
+        if (rows.length > 0) {
+          for (const row of rows) {
+            const rowText = (row.innerText ?? '').toLowerCase();
+            if (!rowText.includes(nameLower)) continue;
+            const yesEl = [...row.querySelectorAll('a, button, input[type="submit"], input[type="button"]')]
+              .find(el => /yes/i.test(el.textContent.trim() + (el.value ?? '')));
+            if (yesEl) {
+              yesEl.click();
+              return { method: 'yes_button', matched: row.innerText.trim() };
+            }
           }
-
-          return { error: 'Publisher selected but no submit button found', matched: match.textContent.trim() };
+          // Collect all publisher names so we can hint what's available.
+          const allPublishers = rows
+            .filter(r => r.querySelector('a, button, input'))
+            .map(r => r.innerText.replace(/\s+/g, ' ').trim())
+            .filter(Boolean);
+          return { error: `Publisher "${name}" not found in list`, availableOptions: allPublishers };
         }
 
-        // ── Layout B: per-publisher "Yes!" buttons ───────────────────────────
-        const panel = document.getElementById('listter');
-        if (!panel) return { error: 'No panel found' };
-
-        const yesEls = [...panel.querySelectorAll('a, button, input[type="submit"]')]
-          .filter(el => /yes/i.test((el.textContent + (el.value || '')).trim()));
-
-        if (yesEls.length === 0) {
-          return { error: 'No publisher dropdown or Yes! buttons found in panel', panelText: panel.innerText.slice(0, 500) };
-        }
-
+        // Flat list of Yes links (non-table layout).
+        const yesEls = [...panel.querySelectorAll('a, button, input[type="submit"], input[type="button"]')]
+          .filter(el => /yes/i.test(el.textContent.trim() + (el.value ?? '')));
         for (const el of yesEls) {
-          const container = el.closest('tr, li, p, div') ?? el.parentElement;
-          const containerText = (container?.innerText ?? '').toLowerCase();
-          if (containerText.includes(nameLower)) {
+          const container = el.closest('li, p, div') ?? el.parentElement;
+          if ((container?.innerText ?? '').toLowerCase().includes(nameLower)) {
             el.click();
-            return { method: 'yes_button', matched: container.innerText.trim() };
+            return { method: 'yes_link', matched: container.innerText.trim() };
           }
         }
-
-        const options = yesEls.map(el => {
-          const container = el.closest('tr, li, p, div') ?? el.parentElement;
-          return (container?.innerText ?? '').trim();
-        });
-        return { error: `Publisher "${name}" not found in checkout list`, availableOptions: options };
+        const options = yesEls.map(el => (el.closest('li, p, div') ?? el.parentElement)?.innerText.trim() ?? '');
+        return { error: `Publisher "${name}" not found`, availableOptions: options, panelText: panel.innerText.slice(0, 500) };
       }, publisher_name, checkoutDate);
 
       console.log('[checkout] Publisher result:', JSON.stringify(publisherResult).slice(0, 300));
 
       if (publisherResult.error) {
         return {
-          error: false,
+          error: true,
           message: publisherResult.error,
-          panelText: formPanel.text,
           availableOptions: publisherResult.availableOptions,
-          hint: 'Check the publisher name spelling against availableOptions.',
+          panelText: publisherResult.panelText ?? formPanel.text.slice(0, 500),
         };
       }
 
-      // Wait for the form submission to complete (may navigate or update via AJAX).
+      // Wait for the form submission / AJAX to complete.
       await session.page.waitForLoadState('networkidle', { timeout: 12000 }).catch(() =>
         session.page.waitForTimeout(2500)
       );
       const finalPanel = await scrapePanel();
       return {
         success: true,
+        territory: territory_number,
         method: publisherResult.method,
         publisherMatched: publisherResult.matched,
         date: checkoutDate,
