@@ -1599,16 +1599,13 @@ export function createCallTool(session) {
     return withBrowser(async () => {
       const page = session.page;
 
-      // Load the full territory list once.
+      // Step 1 — collect territory names + totals from the standard list page.
       await page.goto('https://onlineterritorymanager.com/GetStandard.php?code=A');
       await page.waitForLoadState('networkidle');
 
-      // Collect territory links AND their #Addrs counts from the left-panel table.
-      // #Addrs is the 4th column (index 3) of the main territory list — no AJAX needed.
       let territories = await page.evaluate(() => {
         const table = document.querySelector('table.table');
         if (!table) return [];
-        // Locate #Addrs column index from the header row.
         const headerCells = [...(table.querySelector('thead tr')?.querySelectorAll('th') ?? [])];
         const addrsColIdx = headerCells.findIndex(
           th => th.textContent.includes('#') && th.textContent.includes('Addrs')
@@ -1616,60 +1613,54 @@ export function createCallTool(session) {
         return [...table.querySelectorAll('tbody tr')].map(row => {
           const link = row.querySelector('a[onclick*="getTerList"]');
           if (!link) return null;
-          const m     = (link.getAttribute('onclick') || '').match(/getTerList\((\d+)/);
           const title = link.getAttribute('title') || '';
           const name  = link.textContent.trim();
-          const desc  = title.replace(name + '-', '');
+          const desc  = title.replace(name + '-', '').trim();
           const cells = [...row.querySelectorAll('td')];
           const addrsCell = addrsColIdx >= 0 ? cells[addrsColIdx] : cells[3];
           const total = parseInt(addrsCell?.textContent.trim() || '0', 10);
-          return m ? { id: m[1], name, desc, total: isNaN(total) ? 0 : total } : null;
+          return { name, desc, total: isNaN(total) ? 0 : total };
         }).filter(Boolean);
       });
 
       if (!territories.length) throw new Error('No territories found on GetStandard.php');
 
-      // Filter to a single territory if one was specified.
       if (territory) {
         const needle = String(territory).toLowerCase().trim();
         territories = territories.filter(t => t.name.toLowerCase() === needle);
         if (!territories.length) return { success: false, message: `Territory "${territory}" not found.` };
       }
 
+      // Step 2 — navigate to AddrSearch and use the territory select + Search button.
+      await page.goto('https://www.onlineterritorymanager.com/AddrSearch.php');
+      await page.waitForLoadState('networkidle');
+
       const results = [];
 
       for (const t of territories) {
-        // Clear the panel so stale content from the previous territory doesn't fool the waiter.
-        await page.evaluate(() => {
-          const panel = document.getElementById('listter');
-          if (panel) panel.innerHTML = '';
-        });
+        // Find the <option> whose text starts with the territory name (e.g. "OS-01 - …").
+        const optionValue = await page.evaluate((name) => {
+          const select = document.getElementById('ternum');
+          if (!select) return null;
+          const opt = [...select.options].find(o =>
+            o.textContent.trim().toLowerCase().startsWith(name.toLowerCase())
+          );
+          return opt ? opt.value : null;
+        }, t.name);
 
-        // Click the territory link exactly as a user would.
-        const link = page.locator(`a[onclick*="getTerList(${t.id},"]`).first();
-        await link.scrollIntoViewIfNeeded();
-        await link.click();
-
-        // Wait until the panel has a table with at least one tbody row.
-        const loaded = await page.waitForFunction(
-          () => {
-            const panel = document.getElementById('listter');
-            return (panel?.querySelectorAll('tbody tr').length ?? 0) > 0;
-          },
-          { timeout: 15_000 }
-        ).then(() => true).catch(() => false);
-
-        if (!loaded) {
-          results.push({ name: t.name, desc: t.desc, total: t.total, gated: 0, pct: 0, note: 'timeout' });
+        if (!optionValue) {
+          results.push({ name: t.name, desc: t.desc, total: t.total, gated: 0, pct: 0, note: 'not in search dropdown' });
           continue;
         }
 
-        // Count rows where the LG/Dog column says "Yes".
-        const gated = await page.evaluate(() => {
-          const panel = document.getElementById('listter');
-          if (!panel) return 0;
+        // Select the territory and submit.
+        await page.selectOption('#ternum', optionValue);
+        await page.click('#Search');
+        await page.waitForLoadState('networkidle');
 
-          for (const table of panel.querySelectorAll('table')) {
+        // Find the LG/Dog column and count "Yes" rows in the results table.
+        const gated = await page.evaluate(() => {
+          for (const table of document.querySelectorAll('table')) {
             const headerRow = table.querySelector('tr');
             if (!headerRow) continue;
             const headers = [...headerRow.querySelectorAll('th, td')].map(h => h.textContent.trim());
@@ -1686,6 +1677,10 @@ export function createCallTool(session) {
 
         const pct = t.total > 0 ? Math.round((gated / t.total) * 100) : 0;
         results.push({ name: t.name, desc: t.desc, total: t.total, gated, pct });
+
+        // Navigate back so the form is fresh for the next territory.
+        await page.goto('https://www.onlineterritorymanager.com/AddrSearch.php');
+        await page.waitForLoadState('networkidle');
       }
 
       results.sort((a, b) => b.pct - a.pct);
