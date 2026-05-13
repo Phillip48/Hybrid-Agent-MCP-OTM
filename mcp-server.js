@@ -1639,16 +1639,24 @@ export function createCallTool(session) {
       const results = [];
 
       for (const t of territories) {
-        // Trigger AJAX panel load without navigating away from the page.
-        await page.evaluate((id) => { window.getTerList(parseInt(id), 0, 0, 0); }, t.id);
+        // Clear the panel so stale content from the previous territory doesn't fool the waiter.
+        await page.evaluate(() => {
+          const panel = document.getElementById('listter');
+          if (panel) panel.innerHTML = '';
+        });
 
-        // Wait for panel to contain real address data.
+        // Click the territory link exactly as a user would.
+        const link = page.locator(`a[onclick*="getTerList(${t.id},"]`).first();
+        await link.scrollIntoViewIfNeeded();
+        await link.click();
+
+        // Wait until the panel has a table with at least one tbody row.
         const loaded = await page.waitForFunction(
           () => {
-            const txt = (document.getElementById('listter')?.innerText ?? '').trim();
-            return txt.length > 50 && !txt.startsWith('Please select');
+            const panel = document.getElementById('listter');
+            return (panel?.querySelectorAll('tbody tr').length ?? 0) > 0;
           },
-          { timeout: 10_000 }
+          { timeout: 15_000 }
         ).then(() => true).catch(() => false);
 
         if (!loaded) {
@@ -1656,7 +1664,7 @@ export function createCallTool(session) {
           continue;
         }
 
-        // Count rows where LG/Dog column = "Yes". Total comes from the left-panel table above.
+        // Count rows where the LG/Dog column says "Yes".
         const gated = await page.evaluate(() => {
           const panel = document.getElementById('listter');
           if (!panel) return 0;
@@ -1668,9 +1676,7 @@ export function createCallTool(session) {
             const lgDogIdx = headers.findIndex(h => /LG.{0,3}Dog/i.test(h));
             if (lgDogIdx === -1) continue;
 
-            // Count data rows where the LG/Dog cell says "Yes".
-            const dataRows = [...table.querySelectorAll('tbody tr')];
-            return dataRows.filter(row => {
+            return [...table.querySelectorAll('tbody tr')].filter(row => {
               const cell = row.querySelectorAll('td')[lgDogIdx];
               return cell?.textContent.trim().toLowerCase() === 'yes';
             }).length;
