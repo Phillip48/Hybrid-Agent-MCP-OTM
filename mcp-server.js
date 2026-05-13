@@ -1643,19 +1643,36 @@ export function createCallTool(session) {
           continue;
         }
 
-        // Count total address rows and gated ones in the panel table.
+        // Read #Addrs (total) and LG/Dog (gated) from the territory stats panel.
         const stats = await page.evaluate(() => {
           const panel = document.getElementById('listter');
           if (!panel) return { total: 0, gated: 0 };
-          const rows = [...panel.querySelectorAll('tbody tr')];
-          let total = 0, gated = 0;
-          for (const row of rows) {
-            const cells = row.querySelectorAll('td');
-            if (cells.length < 2) continue;
-            total++;
-            if (row.textContent.toLowerCase().includes('gated')) gated++;
+
+          // Find a table whose header row contains #Addrs and/or LG/Dog columns.
+          for (const table of panel.querySelectorAll('table')) {
+            const headerRow = table.querySelector('tr');
+            if (!headerRow) continue;
+            const headers = [...headerRow.querySelectorAll('th, td')].map(h => h.textContent.trim());
+            const addrsIdx = headers.findIndex(h => h.includes('#Addrs'));
+            const lgDogIdx = headers.findIndex(h => /LG\s*[/\\]\s*Dog/i.test(h));
+            if (addrsIdx === -1 && lgDogIdx === -1) continue;
+
+            const dataRow = [...table.querySelectorAll('tr')][1];
+            if (!dataRow) continue;
+            const cells = [...dataRow.querySelectorAll('td, th')];
+            const total = addrsIdx !== -1 ? parseInt(cells[addrsIdx]?.textContent.trim() || '0', 10) : 0;
+            const gated = lgDogIdx !== -1 ? parseInt(cells[lgDogIdx]?.textContent.trim() || '0', 10) : 0;
+            return { total: isNaN(total) ? 0 : total, gated: isNaN(gated) ? 0 : gated };
           }
-          return { total, gated };
+
+          // Fallback: scan text content for labelled values.
+          const text = panel.innerText || '';
+          let total = 0, gated = 0;
+          const addrsM = text.match(/(\d+)\s*#Addrs|#Addrs\D{0,5}(\d+)/i);
+          if (addrsM) total = parseInt(addrsM[1] ?? addrsM[2], 10);
+          const lgM    = text.match(/(\d+)\s*LG\s*[/\\]\s*Dog|LG\s*[/\\]\s*Dog\D{0,5}(\d+)/i);
+          if (lgM)    gated = parseInt(lgM[1] ?? lgM[2], 10);
+          return { total: isNaN(total) ? 0 : total, gated: isNaN(gated) ? 0 : gated };
         });
 
         const pct = stats.total > 0 ? Math.round((stats.gated / stats.total) * 100) : 0;
