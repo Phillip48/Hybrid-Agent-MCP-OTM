@@ -1599,73 +1599,57 @@ export function createCallTool(session) {
     return withBrowser(async () => {
       const page = session.page;
 
-      // Step 1 — get territory list from GetStandard.php.
-      // Extract the numeric OTM ID from onclick so we can inject it into AddrSearch
-      // even when the #ternum dropdown is empty (a known OTM config issue).
-      await page.goto('https://onlineterritorymanager.com/GetStandard.php?code=A');
-      await page.waitForLoadState('networkidle');
+      // session.navigate() uses OTM_BASE (no www) and handles session expiry.
+      // The www subdomain does not share cookies, so always use the canonical URL.
+      await session.navigate(PAGES.addrSearch);
 
-      let territories = await page.evaluate(() => {
-        const table = document.querySelector('table.table');
-        if (!table) return [];
-        const headerCells = [...(table.querySelector('thead tr')?.querySelectorAll('th') ?? [])];
-        const addrsColIdx = headerCells.findIndex(
-          th => th.textContent.includes('#') && th.textContent.includes('Addrs')
-        );
-        return [...table.querySelectorAll('tbody tr')].map(row => {
-          const link = row.querySelector('a[onclick*="getTerList"]');
-          if (!link) return null;
-          const m = link.getAttribute('onclick').match(/getTerList\((\d+)/);
-          if (!m) return null;
-          const id    = m[1];
-          const title = link.getAttribute('title') || '';
-          const name  = link.textContent.trim();
-          const desc  = title.replace(name + '-', '').trim();
-          const cells = [...row.querySelectorAll('td')];
-          const addrsCell = addrsColIdx >= 0 ? cells[addrsColIdx] : cells[3];
-          const total = parseInt(addrsCell?.textContent.trim() || '0', 10);
-          return { id, name, desc, total: isNaN(total) ? 0 : total };
-        }).filter(Boolean);
+      // Read all territory options — the dropdown is populated server-side.
+      const allOptions = await page.evaluate(() => {
+        const sel = document.getElementById('ternum');
+        if (!sel) return [];
+        return [...sel.options]
+          .filter(o => o.value && o.value.trim() !== '')
+          .map(o => ({
+            value: o.value,
+            label: o.textContent.trim(),
+            // "OS-16 - Cypress Reserve" → name = "OS-16"
+            name:  o.textContent.trim().split(' - ')[0].trim(),
+          }));
       });
 
-      if (!territories.length) throw new Error('No territories found on GetStandard.php');
+      if (!allOptions.length) throw new Error('Territory dropdown (#ternum) not found or empty on AddrSearch.php');
 
+      // Single territory: filter immediately; all territories: scan the full list.
+      let territoriesToScan = allOptions;
       if (territory) {
         const needle = String(territory).toLowerCase().trim();
-        territories = territories.filter(t => t.name.toLowerCase() === needle);
-        if (!territories.length) return { success: false, message: `Territory "${territory}" not found.` };
+        territoriesToScan = allOptions.filter(t =>
+          t.name.toLowerCase() === needle ||
+          t.label.toLowerCase().startsWith(needle)
+        );
+        if (!territoriesToScan.length) {
+          return {
+            success: false,
+            message: `Territory "${territory}" not found. Known: ${allOptions.map(t => t.name).join(', ')}`,
+          };
+        }
       }
-
-      // Step 2 — use AddrSearch.php for each territory.
-      // Inject the territory ID directly into the select via JS so this works
-      // even when the dropdown options are not rendered by OTM.
-      await page.goto('https://www.onlineterritorymanager.com/AddrSearch.php');
-      await page.waitForLoadState('networkidle');
 
       const results = [];
 
-      for (let i = 0; i < territories.length; i++) {
-        const t = territories[i];
+      for (let i = 0; i < territoriesToScan.length; i++) {
+        const t = territoriesToScan[i];
 
-        if (i > 0) {
-          await page.goto('https://www.onlineterritorymanager.com/AddrSearch.php');
-          await page.waitForLoadState('networkidle');
-        }
+        // Navigate back to the clean form for the 2nd+ territory.
+        if (i > 0) await session.navigate(PAGES.addrSearch);
 
-        // Set the select value directly — bypasses the empty dropdown.
-        await page.evaluate((id) => {
-          const sel = document.getElementById('ternum');
-          if (!sel) return;
-          if (![...sel.options].find(o => o.value === id)) {
-            sel.appendChild(new Option('', id));
-          }
-          sel.value = id;
-        }, t.id);
-
+        await page.selectOption('#ternum', t.value);
+        // Sequential click then wait — the form submit starts network activity before
+        // waitForLoadState is called, so it correctly waits for the results to load.
         await page.click('#Search');
         await page.waitForLoadState('networkidle');
 
-        const { gated, debugInfo } = await page.evaluate(() => {
+        const { gated, total, debugInfo } = await page.evaluate(() => {
           for (const table of document.querySelectorAll('table')) {
             const allRows = [...table.querySelectorAll('tr')];
             if (allRows.length < 2) continue;
@@ -1685,21 +1669,22 @@ export function createCallTool(session) {
 
             return {
               gated: values.filter(v => v.toLowerCase() === 'yes').length,
-              debugInfo: { headers, lgDogIdx, totalRows: values.length, uniqueValues },
+              total: values.length,
+              debugInfo: { headers, lgDogIdx, rows: values.length, uniqueValues },
             };
           }
-          // No LG/Dog table found — capture all table headers to aid debugging.
+          // No LG/Dog table found — report what tables ARE on the page.
           const allTableHeaders = [...document.querySelectorAll('table')].map(tbl => {
             const first = tbl.querySelector('tr');
             return first ? [...first.querySelectorAll('th,td')].map(h => h.textContent.replace(/\s+/g, ' ').trim()) : [];
           });
-          return { gated: 0, debugInfo: { lgDogIdx: -1, totalRows: 0, uniqueValues: {}, allTableHeaders } };
+          return { gated: 0, total: 0, debugInfo: { lgDogIdx: -1, rows: 0, uniqueValues: {}, allTableHeaders } };
         });
 
-        console.log(`[gated_report] ${t.name} (id=${t.id}): ${JSON.stringify(debugInfo)}, gated=${gated}`);
+        console.log(`[gated_report] ${t.name} (${t.value}): ${JSON.stringify(debugInfo)}, gated=${gated}, total=${total}`);
 
-        const pct = t.total > 0 ? Math.round((gated / t.total) * 100) : 0;
-        results.push({ name: t.name, desc: t.desc, total: t.total, gated, pct });
+        const pct = total > 0 ? Math.round((gated / total) * 100) : 0;
+        results.push({ name: t.name, label: t.label, gated, total, pct });
       }
 
       results.sort((a, b) => b.pct - a.pct);
@@ -1708,7 +1693,7 @@ export function createCallTool(session) {
         success: true,
         territories_checked: results.length,
         results: results.map(r => ({
-          territory:  `${r.name}${r.desc ? ' — ' + r.desc : ''}`,
+          territory:  r.label,
           gated:      r.gated,
           total:      r.total,
           gated_pct:  `${r.pct}%`,
