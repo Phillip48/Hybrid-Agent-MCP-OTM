@@ -1599,71 +1599,63 @@ export function createCallTool(session) {
     return withBrowser(async () => {
       const page = session.page;
 
-      // Step 1 — collect territory names + totals from the standard list page.
-      await page.goto('https://onlineterritorymanager.com/GetStandard.php?code=A');
-      await page.waitForLoadState('networkidle');
-
-      let territories = await page.evaluate(() => {
-        const table = document.querySelector('table.table');
-        if (!table) return [];
-        const headerCells = [...(table.querySelector('thead tr')?.querySelectorAll('th') ?? [])];
-        const addrsColIdx = headerCells.findIndex(
-          th => th.textContent.includes('#') && th.textContent.includes('Addrs')
-        );
-        return [...table.querySelectorAll('tbody tr')].map(row => {
-          const link = row.querySelector('a[onclick*="getTerList"]');
-          if (!link) return null;
-          const title = link.getAttribute('title') || '';
-          const name  = link.textContent.trim();
-          const desc  = title.replace(name + '-', '').trim();
-          const cells = [...row.querySelectorAll('td')];
-          const addrsCell = addrsColIdx >= 0 ? cells[addrsColIdx] : cells[3];
-          const total = parseInt(addrsCell?.textContent.trim() || '0', 10);
-          return { name, desc, total: isNaN(total) ? 0 : total };
-        }).filter(Boolean);
-      });
-
-      if (!territories.length) throw new Error('No territories found on GetStandard.php');
-
-      if (territory) {
-        const needle = String(territory).toLowerCase().trim();
-        territories = territories.filter(t => t.name.toLowerCase() === needle);
-        if (!territories.length) return { success: false, message: `Territory "${territory}" not found.` };
-      }
-
-      // Step 2 — navigate to AddrSearch and use the territory select + Search button.
+      // Always start at AddrSearch.php — the #ternum dropdown is the source of truth
+      // for available territories, and search results give us both gated + total counts.
       await page.goto('https://www.onlineterritorymanager.com/AddrSearch.php');
       await page.waitForLoadState('networkidle');
 
+      // Read all territory options from the dropdown.
+      const allOptions = await page.evaluate(() => {
+        const select = document.getElementById('ternum');
+        if (!select) return [];
+        return [...select.options]
+          .filter(o => o.value && o.value.trim() !== '')
+          .map(o => {
+            const label = o.textContent.trim();
+            // Extract the short code (e.g. "B-03" from "B-03-Satellite Beach").
+            const m = label.match(/^([A-Za-z]+-\d+)/);
+            return { value: o.value, label, name: m ? m[1] : label };
+          });
+      });
+
+      if (!allOptions.length) throw new Error('No territories found in #ternum dropdown on AddrSearch.php');
+
+      // If a specific territory was requested, filter to it; otherwise scan all.
+      let territoriesToScan = allOptions;
+      if (territory) {
+        const needle = String(territory).toLowerCase().trim();
+        territoriesToScan = allOptions.filter(t =>
+          t.name.toLowerCase() === needle ||
+          t.label.toLowerCase().startsWith(needle)
+        );
+        if (!territoriesToScan.length) {
+          return {
+            success: false,
+            message: `Territory "${territory}" not found. Known territories: ${allOptions.map(t => t.name).slice(0, 20).join(', ')}`,
+          };
+        }
+      }
+
       const results = [];
 
-      for (const t of territories) {
-        // Find the <option> whose text starts with the territory name (e.g. "OS-01 - …").
-        const optionValue = await page.evaluate((name) => {
-          const select = document.getElementById('ternum');
-          if (!select) return null;
-          const opt = [...select.options].find(o =>
-            o.textContent.trim().toLowerCase().startsWith(name.toLowerCase())
-          );
-          return opt ? opt.value : null;
-        }, t.name);
+      for (let i = 0; i < territoriesToScan.length; i++) {
+        const t = territoriesToScan[i];
 
-        if (!optionValue) {
-          results.push({ name: t.name, desc: t.desc, total: t.total, gated: 0, pct: 0, note: 'not in search dropdown' });
-          continue;
+        // Navigate back to the clean form for the 2nd+ territory.
+        if (i > 0) {
+          await page.goto('https://www.onlineterritorymanager.com/AddrSearch.php');
+          await page.waitForLoadState('networkidle');
         }
 
-        // Select the territory and submit — use Promise.all to catch immediate navigation.
-        await page.selectOption('#ternum', optionValue);
-        await Promise.all([
-          page.waitForLoadState('networkidle'),
-          page.click('#Search'),
-        ]);
+        await page.selectOption('#ternum', t.value);
+        // Click THEN waitForLoadState (sequential) — the form submit starts network
+        // activity before waitForLoadState is called, so it correctly waits for results.
+        await page.click('#Search');
+        await page.waitForLoadState('networkidle');
 
-        // Find the LG/Dog column and count "Yes" rows in the results table.
-        // Uses all rows except the first (header) to handle tables with no explicit tbody.
-        // Normalises whitespace so <br> inside headers doesn't break matching.
-        const { gated, debugInfo } = await page.evaluate(() => {
+        // Find the LG/Dog column and count "Yes" rows. Also count total data rows
+        // so gated and total always come from the same source.
+        const { gated, total, debugInfo } = await page.evaluate(() => {
           for (const table of document.querySelectorAll('table')) {
             const allRows = [...table.querySelectorAll('tr')];
             if (allRows.length < 2) continue;
@@ -1673,8 +1665,7 @@ export function createCallTool(session) {
             const lgDogIdx = headers.findIndex(h => /LG.{0,5}Dog/i.test(h));
             if (lgDogIdx < 0) continue;
 
-            const dataRows = allRows.slice(1);
-            const values = dataRows.map(row => {
+            const values = allRows.slice(1).map(row => {
               const cell = row.querySelectorAll('td')[lgDogIdx];
               return (cell?.textContent ?? '').trim();
             });
@@ -1684,20 +1675,22 @@ export function createCallTool(session) {
 
             return {
               gated: values.filter(v => v.toLowerCase() === 'yes').length,
-              debugInfo: { headers, lgDogIdx, totalRows: dataRows.length, uniqueValues },
+              total: values.length,
+              debugInfo: { headers, lgDogIdx, totalRows: values.length, uniqueValues },
             };
           }
-          return { gated: 0, debugInfo: { headers: null, lgDogIdx: -1, totalRows: 0, uniqueValues: {} } };
+          // No LG/Dog table found — show all table headers to aid debugging.
+          const allTableHeaders = [...document.querySelectorAll('table')].map(tbl => {
+            const first = tbl.querySelector('tr');
+            return first ? [...first.querySelectorAll('th,td')].map(h => h.textContent.replace(/\s+/g, ' ').trim()) : [];
+          });
+          return { gated: 0, total: 0, debugInfo: { lgDogIdx: -1, totalRows: 0, uniqueValues: {}, allTableHeaders } };
         });
 
-        console.log(`[gated_report] ${t.name}: ${JSON.stringify(debugInfo)}, gated=${gated}`);
+        console.log(`[gated_report] ${t.name}: ${JSON.stringify(debugInfo)}, gated=${gated}, total=${total}`);
 
-        const pct = t.total > 0 ? Math.round((gated / t.total) * 100) : 0;
-        results.push({ name: t.name, desc: t.desc, total: t.total, gated, pct });
-
-        // Navigate back so the form is fresh for the next territory.
-        await page.goto('https://www.onlineterritorymanager.com/AddrSearch.php');
-        await page.waitForLoadState('networkidle');
+        const pct = total > 0 ? Math.round((gated / total) * 100) : 0;
+        results.push({ name: t.name, label: t.label, gated, total, pct });
       }
 
       results.sort((a, b) => b.pct - a.pct);
@@ -1706,11 +1699,10 @@ export function createCallTool(session) {
         success: true,
         territories_checked: results.length,
         results: results.map(r => ({
-          territory:  `${r.name}${r.desc ? ' — ' + r.desc : ''}`,
+          territory:  r.label,
           gated:      r.gated,
           total:      r.total,
           gated_pct:  `${r.pct}%`,
-          ...(r.note ? { note: r.note } : {}),
         })),
       };
     });
