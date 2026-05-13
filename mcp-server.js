@@ -283,6 +283,11 @@ export const OTM_TOOLS = [
       },
     },
   },
+  {
+    name: 'auto_assign_addresses',
+    description: 'Runs the OTM Auto Assign process: selects all territories, then clicks Auto Assign (Step 3) to redistribute new addresses from the NA-New Addresses system territory into their correct territories based on map regions.',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
 // ── Tool implementation factory ───────────────────────────────────────────────
@@ -323,6 +328,7 @@ export function createCallTool(session) {
     addrEntry:        '/AdminSingleAddr.php',
     dupChecker:       '/DupChecker.php',
     // Territory admin
+    autoAssign:       '/AutoAssignAdmin.php',
     terRoute:         '/TerRoute.php',
     terGroups:        '/TerGroupAdmin.php',
     terTypes:         '/TerTypeAdmin.php',
@@ -1702,6 +1708,48 @@ export function createCallTool(session) {
     });
   }
 
+  async function handleAutoAssignAddresses() {
+    return withBrowser(async () => {
+      await session.navigate(PAGES.autoAssign);
+
+      // Select every option in the territory multi-select.
+      const territoryCount = await session.evaluate(() => {
+        const sel = document.getElementById('TerSel');
+        if (!sel) return 0;
+        [...sel.options].forEach(o => { o.selected = true; });
+        return sel.options.length;
+      });
+
+      if (territoryCount === 0) {
+        return { error: true, message: 'Territory list (#TerSel) not found or empty on AutoAssignAdmin.php' };
+      }
+
+      console.log(`[auto-assign] Selected all ${territoryCount} territories — clicking Auto Assign`);
+
+      // Click the Step 3 button. Its onclick fires runAssign('assignit') which does an
+      // AJAX POST and then writes results into #results.
+      await session.page.click('#AutoAsgn');
+
+      // Wait up to 60 s for the AJAX response to populate #results.
+      await session.page.waitForFunction(
+        () => (document.getElementById('results')?.innerText ?? '').trim().length > 0,
+        { timeout: 60000 }
+      );
+
+      const { results, msgbox } = await session.evaluate(() => ({
+        results: (document.getElementById('results')?.innerText ?? '').trim(),
+        msgbox:  (document.getElementById('msgbox')?.innerText ?? '').trim(),
+      }));
+
+      return {
+        success: true,
+        territories_selected: territoryCount,
+        result: results,
+        message: msgbox || undefined,
+      };
+    });
+  }
+
   // ── Dispatch ────────────────────────────────────────────────────────────────
 
   return async function callTool(name, args = {}) {
@@ -1743,6 +1791,7 @@ export function createCallTool(session) {
       case 'route_territory':             return handleRouteTerritory(args);
       case 'add_address':                 return handleAddAddress(args);
       case 'gated_address_report':        return handleGatedAddressReport(args);
+      case 'auto_assign_addresses':       return handleAutoAssignAddresses();
       default:
         return { error: true, message: `Unknown tool: ${name}` };
     }
