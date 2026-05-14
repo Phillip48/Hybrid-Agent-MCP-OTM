@@ -37,9 +37,9 @@ TERRITORIES
   What is the status of territory OR-15A?
   Who currently has territory OR-15A?
   Show me all checked-out territories
-  Assign territory OR-15A to Phillip Pereira
   Check in territory OR-15A
-  Route territory OR-15A
+  Route territory OR-15A - TESTING
+  Assign territory OR-15A to Phillip Pereira - TESTING
 
 REPORTS
   Pull a report of total confirmed addresses
@@ -54,7 +54,6 @@ REPORTS
 
 PUBLISHERS
   List all publishers
-  Show me publishers in group 2
   Find publisher John Smith
 
 ADDRESS TOOLS
