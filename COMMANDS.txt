@@ -38,7 +38,7 @@ TERRITORIES
   Who currently has territory OR-15A?
   Show me all checked-out territories
   Assign territory OR-15A to Phillip Pereira
-  Return territory OR-15A
+  Check in territory OR-15A
   Route territory OR-15A
 
 REPORTS

@@ -620,48 +620,78 @@ export function createCallTool(session) {
     });
   }
 
+  // Navigate to the checked-out admin page and ensure check-in buttons are visible.
+  // The PreCheckIn.php image links only appear after clicking the admin-options toggle.
+  async function navigateToCheckedOut() {
+    await session.navigate(PAGES.checkedOut);
+
+    // Check if check-in links are already visible.
+    let hasLinks = await session.evaluate(() =>
+      document.querySelectorAll('a[href*="PreCheckIn.php"]').length > 0
+    );
+    if (hasLinks) return;
+
+    // Click the admin-options toggle — OTM labels it with "admin" somewhere.
+    const toggled = await session.evaluate(() => {
+      const candidates = [...document.querySelectorAll('a, button, input[type="button"], input[type="submit"]')];
+      const toggle = candidates.find(el => {
+        const text = ((el.textContent ?? '') + (el.value ?? '') + (el.title ?? '') + (el.id ?? '')).toLowerCase();
+        return text.includes('admin');
+      });
+      if (toggle) { toggle.click(); return true; }
+      return false;
+    });
+
+    if (toggled) {
+      await session.page.waitForTimeout(1500);
+    }
+  }
+
+  // Find the PreCheckIn.php href for a territory on the checked-out admin page.
+  async function findCheckInHref(territory_number) {
+    return session.evaluate((num) => {
+      const needle = num.toLowerCase().trim();
+
+      // Primary: match by MyTerDescr URL param (most reliable).
+      for (const a of document.querySelectorAll('a[href*="PreCheckIn.php"]')) {
+        try {
+          const qs     = a.href.split('?')[1] ?? '';
+          const params = new URLSearchParams(qs);
+          const descr  = (params.get('MyTerDescr') ?? '').replace(/\+/g, ' ').toLowerCase();
+          if (descr.startsWith(needle)) return a.href;
+        } catch {}
+      }
+
+      // Fallback: find a row whose text contains the territory number, then
+      // grab any PreCheckIn link inside that row.
+      for (const row of document.querySelectorAll('tr')) {
+        if (!row.innerText.toLowerCase().includes(needle)) continue;
+        const a = row.querySelector('a[href*="PreCheckIn.php"], a[title="Check in!"]');
+        if (a) return a.href;
+      }
+
+      return null;
+    }, territory_number);
+  }
+
   async function handleReturnTerritory({ territory_number, date }) {
     return withBrowser(async () => {
-      // Step 1: Navigate to Checked Out Admin view.
+      // Step 1: Go to Checked Out Admin and ensure check-in buttons are visible.
       console.log(`[return] Navigating to checked-out admin view for ${territory_number}`);
-      await session.navigate(PAGES.checkedOut);
+      await navigateToCheckedOut();
 
-      // Step 2: Find the row containing the territory number and grab the
-      // PreCheckIn.php href from its check-in image link.
-      // Link format: <a href="PreCheckIn.php?MyTerID=...&MyTerDescr=OR-15A+..." title="Check in!">
-      //               <img alt="Check In" src="ListSm2.png">
-      //             </a>
-      const checkInHref = await session.evaluate((num) => {
-        const needle = num.toLowerCase().trim();
-        // Walk every <a href="PreCheckIn.php..."> and pick the one whose
-        // decoded MyTerDescr param starts with the requested territory number.
-        const links = [...document.querySelectorAll('a[href*="PreCheckIn.php"]')];
-        for (const a of links) {
-          try {
-            const params = new URLSearchParams(a.href.split('?')[1] ?? '');
-            const descr  = decodeURIComponent(params.get('MyTerDescr') ?? '').replace(/\+/g, ' ').toLowerCase();
-            if (descr.startsWith(needle) || descr.includes(' ' + needle)) return a.href;
-          } catch {}
-        }
-        // Fallback: row-text match for territories with non-standard naming.
-        const rows = [...document.querySelectorAll('tr')];
-        for (const row of rows) {
-          if (!row.innerText.toLowerCase().includes(needle)) continue;
-          const a = row.querySelector('a[href*="PreCheckIn.php"]');
-          if (a) return a.href;
-        }
-        return null;
-      }, territory_number);
+      // Step 2: Find this territory's check-in link.
+      const checkInHref = await findCheckInHref(territory_number);
 
       if (!checkInHref) {
-        const listed = await session.evaluate((num) => {
-          return document.body.innerText.toLowerCase().includes(num.toLowerCase());
-        }, territory_number);
+        const listed = await session.evaluate((num) =>
+          document.body.innerText.toLowerCase().includes(num.toLowerCase())
+        , territory_number);
         return {
           error: true,
           message: listed
-            ? `Territory "${territory_number}" is on the checked-out page but has no check-in button — it may not be checked out under an admin-visible account.`
-            : `Territory "${territory_number}" was not found in the checked-out list. It may already be returned.`,
+            ? `Territory "${territory_number}" is listed on the checked-out page but has no check-in button.`
+            : `Territory "${territory_number}" was not found in the checked-out list — it may already be returned.`,
         };
       }
 
@@ -680,9 +710,7 @@ export function createCallTool(session) {
         console.log(`[return] Date set to ${fmt}`);
       }
 
-      // Step 5: Submit the check-in form.
-      // PreCheckIn.php may show a routing question ("Do you want to route?") —
-      // click No. If no routing question, click the primary submit button.
+      // Step 5: Submit — click No on the routing question, or the primary submit.
       const submitted = await session.evaluate(() => {
         const noBtn = document.querySelector('input[name="No"], input[value="No"], button[value="No"]');
         if (noBtn) { noBtn.click(); return 'no'; }
@@ -701,10 +729,10 @@ export function createCallTool(session) {
 
   async function handleGetTerritoryStatus({ territory_number }) {
     return withBrowser(async () => {
-      await session.navigate(PAGES.checkedOut);
+      await navigateToCheckedOut();
       const row = await session.evaluate((num) => {
         const re   = new RegExp(num.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i');
-        const rows = [...document.querySelectorAll('table tbody tr')];
+        const rows = [...document.querySelectorAll('table tr')];
         const found = rows.find(r => re.test(r.textContent));
         return found ? found.innerText.replace(/\s+/g, ' ').trim() : null;
       }, territory_number);
@@ -718,12 +746,15 @@ export function createCallTool(session) {
 
   async function handleListCheckedOut() {
     return withBrowser(async () => {
-      await session.navigate(PAGES.checkedOut);
+      await navigateToCheckedOut();
       const table = await session.evaluate(() => {
-        const headers = [...document.querySelectorAll('table thead th, table thead td')].map(th => th.textContent.trim());
-        const rows    = [...document.querySelectorAll('table tbody tr')].map(tr =>
-          [...tr.querySelectorAll('td')].map(td => td.textContent.trim())
-        ).filter(r => r.some(c => c));
+        // Use all <tr> rows regardless of whether thead/tbody are present.
+        const allRows = [...document.querySelectorAll('table tr')];
+        if (allRows.length === 0) return { headers: [], rows: [] };
+        const headers = [...allRows[0].querySelectorAll('th, td')].map(h => h.textContent.trim());
+        const rows    = allRows.slice(1)
+          .map(tr => [...tr.querySelectorAll('td')].map(td => td.textContent.trim()))
+          .filter(r => r.some(c => c));
         return { headers, rows };
       });
       return { ...table, count: table.rows.length };
