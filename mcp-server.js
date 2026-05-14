@@ -622,87 +622,80 @@ export function createCallTool(session) {
 
   async function handleReturnTerritory({ territory_number, date }) {
     return withBrowser(async () => {
-      // ── Step 1: Navigate to checked-out admin view ────────────────────────
-      console.log(`[return] Navigating to checked-out admin view`);
+      // Step 1: Navigate to Checked Out Admin view.
+      console.log(`[return] Navigating to checked-out admin view for ${territory_number}`);
       await session.navigate(PAGES.checkedOut);
 
-      // ── Step 2: Enable Admin Options so check-in buttons appear ──────────
-      // The check-in image button (PreCheckIn.php link) only shows when
-      // admin options are turned on. Click the toggle if it exists.
-      const adminToggled = await session.evaluate(() => {
-        const els = [...document.querySelectorAll('a, button, input[type="button"]')];
-        const toggle = els.find(el =>
-          /admin.?option|show.?admin|turn.?on.?admin/i.test(el.textContent + el.value + el.title)
-        );
-        if (toggle) { toggle.click(); return true; }
-        return false;
-      });
-      if (adminToggled) {
-        console.log(`[return] Admin options toggled — waiting for page to update`);
-        await session.page.waitForTimeout(1500);
-      }
-
-      // ── Step 3: Find the PreCheckIn.php link for this territory ──────────
-      // The link looks like: <a href="PreCheckIn.php?MyTerID=XXXX&MyTerDescr=OR-15A-...">
-      // Territory number appears in MyTerDescr URL param.
+      // Step 2: Find the row containing the territory number and grab the
+      // PreCheckIn.php href from its check-in image link.
+      // Link format: <a href="PreCheckIn.php?MyTerID=...&MyTerDescr=OR-15A+..." title="Check in!">
+      //               <img alt="Check In" src="ListSm2.png">
+      //             </a>
       const checkInHref = await session.evaluate((num) => {
-        const re    = new RegExp(num.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
+        const needle = num.toLowerCase().trim();
+        // Walk every <a href="PreCheckIn.php..."> and pick the one whose
+        // decoded MyTerDescr param starts with the requested territory number.
         const links = [...document.querySelectorAll('a[href*="PreCheckIn.php"]')];
-        const link  = links.find(a => re.test(decodeURIComponent(a.href)));
-        return link ? link.href : null;
+        for (const a of links) {
+          try {
+            const params = new URLSearchParams(a.href.split('?')[1] ?? '');
+            const descr  = decodeURIComponent(params.get('MyTerDescr') ?? '').replace(/\+/g, ' ').toLowerCase();
+            if (descr.startsWith(needle) || descr.includes(' ' + needle)) return a.href;
+          } catch {}
+        }
+        // Fallback: row-text match for territories with non-standard naming.
+        const rows = [...document.querySelectorAll('tr')];
+        for (const row of rows) {
+          if (!row.innerText.toLowerCase().includes(needle)) continue;
+          const a = row.querySelector('a[href*="PreCheckIn.php"]');
+          if (a) return a.href;
+        }
+        return null;
       }, territory_number);
 
       if (!checkInHref) {
-        // If no PreCheckIn link found, check whether territory is even listed.
         const listed = await session.evaluate((num) => {
-          const re = new RegExp(num.replace(/[-[\]{}()*+?.,\\^$|#\s]/g, '\\$&'), 'i');
-          return re.test(document.body.innerText);
+          return document.body.innerText.toLowerCase().includes(num.toLowerCase());
         }, territory_number);
-
         return {
-          error: false,
+          error: true,
           message: listed
-            ? `Found territory "${territory_number}" on the page but no check-in button. Admin options may not be enabled, or the territory is not checked out to your account.`
+            ? `Territory "${territory_number}" is on the checked-out page but has no check-in button — it may not be checked out under an admin-visible account.`
             : `Territory "${territory_number}" was not found in the checked-out list. It may already be returned.`,
         };
       }
 
       console.log(`[return] Found check-in link: ${checkInHref}`);
 
-      // ── Step 4: Navigate to the check-in page ────────────────────────────
+      // Step 3: Navigate to PreCheckIn.php for this territory.
       await session.page.goto(checkInHref, { waitUntil: 'domcontentloaded', timeout: 20000 });
 
-      // ── Step 5: Fill date if provided (before answering the routing question) ──
+      // Step 4: Set the check-in date if provided.
       if (date) {
         const fmt = formatDate(date);
         await session.evaluate((dt) => {
-          const inp = document.querySelector('input[type="date"], input[name*="date" i]');
+          const inp = document.querySelector('input[type="date"], input[name*="date" i], input[name*="Date"]');
           if (inp) { inp.value = dt; inp.dispatchEvent(new Event('change', { bubbles: true })); }
         }, fmt);
         console.log(`[return] Date set to ${fmt}`);
       }
 
-      // ── Step 6: Click "No" to the routing question ────────────────────────
-      // OTM asks "Do you want to route this territory?" — always click No.
-      const noClicked = await session.evaluate(() => {
-        const btn = document.querySelector('input[name="No"], input[value="No"]');
-        if (btn) { btn.click(); return true; }
-        return false;
+      // Step 5: Submit the check-in form.
+      // PreCheckIn.php may show a routing question ("Do you want to route?") —
+      // click No. If no routing question, click the primary submit button.
+      const submitted = await session.evaluate(() => {
+        const noBtn = document.querySelector('input[name="No"], input[value="No"], button[value="No"]');
+        if (noBtn) { noBtn.click(); return 'no'; }
+        const submitBtn = document.querySelector('input[type="submit"], button[type="submit"]');
+        if (submitBtn) { submitBtn.click(); return 'submit'; }
+        return null;
       });
 
-      if (!noClicked) {
-        // No routing question found — try a generic submit.
-        await session.evaluate(() => {
-          const btn = document.querySelector('input[type="submit"], button[type="submit"]');
-          if (btn) btn.click();
-        });
-      }
+      console.log(`[return] Submitted via: ${submitted}`);
+      await session.page.waitForLoadState('networkidle', { timeout: 15000 }).catch(() => {});
 
-      console.log(`[return] Routing question answered (No) — waiting for confirmation`);
-      await session.page.waitForLoadState('networkidle').catch(() => {});
-
-      const resultText = await session.evaluate(() => document.body.innerText);
-      return { success: true, result: resultText.slice(0, 1000) };
+      const resultText = await session.evaluate(() => document.body.innerText.slice(0, 800));
+      return { success: true, territory: territory_number, result: resultText };
     });
   }
 

@@ -51,7 +51,6 @@ REPORTS
   Run the territory list report
   Export the territory list
   Show letter writing stats
-  Export address list with return visits
 
 PUBLISHERS
   List all publishers
