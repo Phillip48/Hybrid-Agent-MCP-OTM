@@ -1570,9 +1570,12 @@ export function createCallTool(session) {
       const success    = /success|saved|added|record/i.test(resultText);
       console.log(`[add_address] Save result: ${success ? 'success' : 'unclear'}`);
 
-      return success
+      const result = success
         ? { success: true,  address: fullAddress, message: 'Address added successfully.' }
         : { success: false, address: fullAddress, message: `Save result unclear. Page text: ${resultText.slice(0, 300)}` };
+
+      await new Promise(resolve => setTimeout(resolve, 3000));
+      return result;
     });
   }
 
